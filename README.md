@@ -48,20 +48,20 @@ The program supports the following commands:
 To run the program, use the following command format:
 
 ```
-python main.py <command>
+python run.py <command>
 ```
 
 ### Examples
 #### Execute new parsing
 
-```python main.py new```
+```python run.py new```
 
 #### Update existing parsing
-```python main.py update```
+```python run.py update```
 
 #### Export data
 
-```python main.py export```
+```python run.py export```
 
 ## Configuration
 Before the first run of the program, you need to set up the configuration file config.json.
