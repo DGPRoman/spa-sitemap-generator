@@ -55,8 +55,8 @@ class LinkParser:
             self.next_page_url = DatabaseManager().get_next_page()
 
     def _save_links(self, links):
-        new_links = [link.get_attribute('href') for link in links if self._is_valid_link(link)]
-        DatabaseManager().save_links(new_links)
+        new_links = {link.get_attribute('href') for link in links if self._is_valid_link(link)}
+        DatabaseManager().save_links(list(new_links))
 
     def _is_valid_link(self, link) -> bool:
         href = link.get_attribute('href')
