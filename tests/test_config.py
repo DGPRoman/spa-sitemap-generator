@@ -49,9 +49,15 @@ def test_a_json_list_is_rejected(tmp_path: Path) -> None:
         Config.load(write_config(tmp_path, ["https://a/"]))
 
 
-def test_base_url_is_required(tmp_path: Path) -> None:
-    with pytest.raises(ConfigError, match="base_url"):
-        Config.load(write_config(tmp_path, {"delay": 2}))
+def test_a_config_without_a_target_is_valid_but_cannot_crawl(tmp_path: Path) -> None:
+    """`export` and `status` read a database, so they need no URL; crawling does."""
+    config = Config.load(write_config(tmp_path, {"delay": 2}))
+    assert config.base_url is None
+
+    with pytest.raises(ConfigError, match=r"--url"):
+        config.require_base_url()
+    with pytest.raises(ConfigError, match=r"--url"):
+        config.policy()
 
 
 # -- backwards compatibility -------------------------------------------------
@@ -162,18 +168,9 @@ def test_a_malformed_window_size_is_rejected() -> None:
 # -- overrides ---------------------------------------------------------------
 
 
-def test_overrides_replace_only_what_was_supplied() -> None:
-    config = Config(**MINIMAL, delay=3.0)
-    updated = config.with_overrides(delay=None, max_pages=10)
-
-    assert updated.delay == 3.0  # None means "not supplied on the CLI"
-    assert updated.max_pages == 10
-    assert config.max_pages is None  # the original is untouched
-
-
-def test_overrides_are_validated_too() -> None:
+def test_an_override_is_validated_like_any_other_value(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="base_url"):
-        Config(**MINIMAL).with_overrides(base_url="not-a-url")
+        Config.from_sources(tmp_path / "absent.json", base_url="not-a-url")
 
 
 # -- derived policy ----------------------------------------------------------
@@ -187,3 +184,54 @@ def test_the_policy_reflects_the_scope_settings() -> None:
     assert policy.scope.path_prefix == "/docs/"
     assert policy.scope.include_subdomains is True
     assert policy.hash_routing is True
+
+
+# -- config file is optional -------------------------------------------------
+
+
+def test_a_url_alone_needs_no_config_file(tmp_path: Path) -> None:
+    """A target URL must never have to be written to a file to be crawlable."""
+    config = Config.from_sources(tmp_path / "absent.json", base_url="https://example.com/")
+    assert config.base_url == "https://example.com/"
+    assert config.delay == 1.0
+
+
+def test_a_named_config_file_must_exist(tmp_path: Path) -> None:
+    """Silently ignoring an explicit -c would hide a typo in the path."""
+    with pytest.raises(ConfigError, match="config file not found"):
+        Config.from_sources(
+            tmp_path / "absent.json", must_exist=True, base_url="https://example.com/"
+        )
+
+
+def test_neither_file_nor_url_names_both_ways_out(tmp_path: Path) -> None:
+    config = Config.from_sources(tmp_path / "absent.json")
+    with pytest.raises(ConfigError, match=r"--url.*base_url"):
+        config.require_base_url()
+
+
+def test_overrides_win_over_the_file(tmp_path: Path) -> None:
+    path = write_config(tmp_path, {"base_url": "https://from-file.test/", "delay": 9})
+    config = Config.from_sources(path, base_url="https://from-cli.test/")
+
+    assert config.base_url == "https://from-cli.test/"
+    assert config.delay == 9  # untouched by the override
+
+
+def test_unsupplied_overrides_do_not_erase_file_values(tmp_path: Path) -> None:
+    path = write_config(tmp_path, {"base_url": "https://a.test/", "delay": 4})
+    config = Config.from_sources(path, base_url=None, delay=None, max_pages=7)
+
+    assert (config.base_url, config.delay, config.max_pages) == ("https://a.test/", 4, 7)
+
+
+def test_the_url_alias_also_satisfies_the_requirement(tmp_path: Path) -> None:
+    path = write_config(tmp_path, {"url": "https://legacy.test/"})
+    assert Config.from_sources(path).base_url == "https://legacy.test/"
+
+
+def test_a_directory_in_place_of_a_config_is_not_read(tmp_path: Path) -> None:
+    """is_file() rather than exists(): a directory must not be opened as JSON."""
+    (tmp_path / "config.json").mkdir()
+    config = Config.from_sources(tmp_path / "config.json", base_url="https://a.test/")
+    assert config.base_url == "https://a.test/"

@@ -32,10 +32,18 @@ Installing with `-e .` gives you the `spa-sitemap` command. Without it, use
 
 ## Quick start
 
+No config file needed -- the URL is an argument:
+
 ```bash
-cp config.example.json config.json     # then set "base_url"
-spa-sitemap new                        # crawl from scratch
-spa-sitemap export                     # write sitemap.xml
+spa-sitemap new --url https://example.com/   # crawl from scratch
+spa-sitemap export                           # write sitemap.xml
+```
+
+For a site you crawl repeatedly, put the settings in a file instead:
+
+```bash
+cp config.example.json config.json           # then set "base_url"
+spa-sitemap new
 ```
 
 ## Commands
@@ -71,7 +79,10 @@ picks up cleanly. Pressing it twice aborts immediately.
 
 ## Configuration
 
-`config.json`, or any file passed with `-c`. Only `base_url` is required.
+Entirely optional. `--url` alone is enough to run, so a target URL never has to be
+written into a file to be crawlable. When `config.json` exists it is used; a file
+named with `-c` must exist, so a mistyped path fails instead of being ignored.
+Command-line flags override file values.
 
 ```json
 {
@@ -84,7 +95,7 @@ picks up cleanly. Pressing it twice aborts immediately.
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `base_url` | *required* | Where to start. Also defines the crawl scope. |
+| `base_url` | *required* | Where to start; also defines the crawl scope. Or pass `--url`. |
 | `delay` | `1.0` | Seconds between page loads. |
 | `respect_robots` | `true` | Obey robots.txt, including `Crawl-delay`. |
 | `user_agent` | `spa-sitemap-generator` | Sent by the browser and when fetching robots.txt. |

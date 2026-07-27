@@ -69,7 +69,7 @@ def test_crawl_options_actually_reach_the_namespace() -> None:
 
 
 def test_unsupplied_flags_stay_none_so_the_config_wins() -> None:
-    """`None` is what tells `with_overrides` to leave the config value alone."""
+    """`None` is what tells `from_sources` to leave the config file's value alone."""
     args = build_parser().parse_args(["new"])
     assert args.headless is None
     assert args.respect_robots is None
@@ -84,10 +84,11 @@ def test_verbose_and_quiet_are_mutually_exclusive() -> None:
 # -- config errors -----------------------------------------------------------
 
 
-def test_a_missing_config_is_an_error_not_a_traceback(tmp_path: Path,
-                                                     monkeypatch: pytest.MonkeyPatch) -> None:
+def test_crawling_without_a_config_or_url_is_an_error_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.chdir(tmp_path)
-    assert main(["status"]) == EXIT_ERROR
+    assert main(["new", "-y"]) == EXIT_ERROR
 
 
 def test_an_invalid_config_value_is_an_error(project: Path) -> None:
@@ -253,3 +254,83 @@ def test_configure_logging_does_not_duplicate_handlers() -> None:
     cli.configure_logging()
     cli.configure_logging(verbose=True)
     assert len(logging.getLogger("spa_sitemap").handlers) == 1
+
+
+# -- the config file is optional ---------------------------------------------
+
+
+def test_url_alone_runs_without_a_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The old error told you to "pass --url" while refusing to run without a file."""
+    monkeypatch.chdir(tmp_path)
+    seen: list[str] = []
+    monkeypatch.setattr(
+        cli, "_run_crawl", lambda config, store, **kw: seen.append(config.base_url) or EXIT_OK
+    )
+
+    assert main(["new", "--url", "https://cli-only.test/", "-y"]) == EXIT_OK
+    assert seen == ["https://cli-only.test/"]
+    assert not (tmp_path / "config.json").exists()
+
+
+def test_no_config_and_no_url_explains_both_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert main(["new", "-y"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "--url" in err and "base_url" in err
+
+
+def test_export_needs_no_config_and_no_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exporting reads back an existing crawl; demanding the URL again is busywork."""
+    monkeypatch.chdir(tmp_path)
+    crawled(tmp_path / "db" / "sitemap.db", {"https://recorded.test/a": 0})
+
+    assert main(["export"]) == EXIT_OK
+    root = ET.parse(tmp_path / "sitemap.xml").getroot()
+    locs = [e.text for e in root.iter("{http://www.sitemaps.org/schemas/sitemap/0.9}loc")]
+    assert locs == ["https://recorded.test/a"]
+
+
+def test_status_needs_no_config_and_reports_the_recorded_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    crawled(tmp_path / "db" / "sitemap.db", {"https://example.com/a": 0})
+
+    assert main(["status"]) == EXIT_OK
+    assert "https://example.com/" in capsys.readouterr().out
+
+
+def test_update_takes_the_site_from_the_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    db = tmp_path / "db" / "sitemap.db"
+    crawled(db, {"https://example.com/a": 0})
+    with UrlStore(db) as store:
+        store.enqueue(["https://example.com/queued"], depth=1)
+
+    seen: list[str | None] = []
+    monkeypatch.setattr(
+        cli, "_run_crawl", lambda config, store, **kw: seen.append(config.base_url) or EXIT_OK
+    )
+    assert main(["update"]) == EXIT_OK
+    assert seen == ["https://example.com/"]
+
+
+def test_an_explicitly_named_missing_config_is_an_error(project: Path) -> None:
+    assert main(["status", "-c", "does-not-exist.json"]) == EXIT_ERROR
+
+
+def test_an_alternate_config_file_is_honoured(project: Path,
+                                              capsys: pytest.CaptureFixture[str]) -> None:
+    (project / "other.json").write_text(
+        json.dumps({"base_url": "https://other.test/"}), encoding="utf-8"
+    )
+    assert main(["status", "-c", "other.json"]) == EXIT_OK
+    assert "https://other.test/" in capsys.readouterr().out

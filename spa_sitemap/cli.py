@@ -16,6 +16,7 @@ import sys
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from types import FrameType
@@ -50,16 +51,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument(
-        "-c", "--config", type=Path, default=DEFAULT_CONFIG_PATH,
-        help=f"config file (default: {DEFAULT_CONFIG_PATH})",
+        "-c", "--config", type=Path, default=None,
+        help=f"config file; must exist if given. Without it, {DEFAULT_CONFIG_PATH} "
+             f"is used when present, otherwise --url alone is enough",
     )
     common.add_argument("--database", type=Path, dest="database_path", help="SQLite file to use")
+    common.add_argument(
+        "--url", dest="base_url",
+        help="the site to crawl; overrides base_url from the config file",
+    )
     verbosity = common.add_mutually_exclusive_group()
     verbosity.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     verbosity.add_argument("-q", "--quiet", action="store_true", help="warnings and errors only")
 
     crawl_opts = argparse.ArgumentParser(add_help=False)
-    crawl_opts.add_argument("--url", dest="base_url", help="override base_url from the config")
     crawl_opts.add_argument("--delay", type=float, help="seconds to wait between pages")
     crawl_opts.add_argument("--max-pages", type=int, dest="max_pages", help="stop after N pages")
     crawl_opts.add_argument("--max-depth", type=int, dest="max_depth", help="stop at depth N")
@@ -131,7 +136,9 @@ def _config_from_args(args: argparse.Namespace) -> Config:
             "max_pages", "max_depth", "max_runtime", "database_path", "output_path",
         )
     }
-    return Config.load(args.config).with_overrides(**overrides)
+    # A named -c must exist; the default config.json is used only if it is there,
+    # so `--url ...` works on its own with no config file at all.
+    return Config.from_sources(args.config, must_exist=args.config is not None, **overrides)
 
 
 #: Sentinel for ``--lastmod visited``: take the date from each page's own visit.
@@ -159,6 +166,7 @@ def _parse_lastmod(value: str | None) -> date | str | None:
 
 def cmd_new(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
+    base_url = config.require_base_url()
     with UrlStore(config.database_path) as store:
         known = store.total()
         if known and not args.yes and not _confirm_discard(config, known):
@@ -167,8 +175,8 @@ def cmd_new(args: argparse.Namespace) -> int:
 
         log.info("clearing %s", config.database_path)
         store.reset()
-        store.set_meta("base_url", config.base_url)
-        return _run_crawl(config, store, seeds=[config.base_url])
+        store.set_meta("base_url", base_url)
+        return _run_crawl(config, store, seeds=[base_url])
 
 
 def _confirm_discard(config: Config, known: int) -> bool:
@@ -181,19 +189,36 @@ def _confirm_discard(config: Config, known: int) -> bool:
     return answer.strip().lower() in {"y", "yes"}
 
 
+def _with_stored_base_url(config: Config) -> Config:
+    """Fall back to the site the database was crawled with.
+
+    `update` resumes an existing crawl, so the target is already recorded in the
+    database -- asking for it again on the command line would be busywork.
+    """
+    if config.base_url:
+        return config
+    with UrlStore(config.database_path) as store:
+        stored = store.get_meta("base_url")
+    return replace(config, base_url=stored) if stored else config
+
+
 def cmd_update(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
+    # Resuming needs a target, but the database already recorded one, so the
+    # config only has to supply it when it disagrees or is absent.
+    config = _with_stored_base_url(config)
+    base_url = config.require_base_url()
     with UrlStore(config.database_path) as store:
         if store.total() == 0:
             log.error("nothing to resume in %s -- run `new` first", config.database_path)
             return EXIT_ERROR
 
         previous = store.get_meta("base_url")
-        if previous and previous != config.base_url:
+        if previous and previous != base_url:
             log.error(
                 "%s was crawled with base_url %s but the config says %s. "
                 "Run `new` to start over, or point --url at the original site.",
-                config.database_path, previous, config.base_url,
+                config.database_path, previous, base_url,
             )
             return EXIT_ERROR
 
@@ -203,7 +228,7 @@ def cmd_update(args: argparse.Namespace) -> int:
             log.info("run `export` to write the sitemap, or `new` to crawl again")
             return EXIT_OK
 
-        return _run_crawl(config, store, seeds=[config.base_url])
+        return _run_crawl(config, store, seeds=[base_url])
 
 
 def cmd_export(args: argparse.Namespace) -> int:
@@ -249,9 +274,10 @@ def cmd_status(args: argparse.Namespace) -> int:
         counts = store.counts()
         total = store.total()
         problems = store.problems(limit=10)
+        crawled_site = store.get_meta("base_url")
 
     print(f"database : {config.database_path}")
-    print(f"base URL : {config.base_url}")
+    print(f"base URL : {config.base_url or crawled_site or '(none recorded)'}")
     print(f"known    : {total} URLs")
     for status, count in counts.items():
         print(f"  {status:<11} {count}")
@@ -296,7 +322,7 @@ def _run_crawl(config: Config, store: UrlStore, *, seeds: Sequence[str]) -> int:
         respect_canonical=config.respect_canonical,
     )
 
-    log.info("crawling %s (scope %s%s)", config.base_url, policy.scope.origin,
+    log.info("crawling %s (scope %s%s)", config.require_base_url(), policy.scope.origin,
              policy.scope.path_prefix)
     with renderer, graceful_interrupt(crawler):
         stats = crawler.crawl(seeds)
@@ -310,7 +336,7 @@ def _load_robots(config: Config) -> Robots:
     if not config.respect_robots:
         log.warning("robots.txt is being ignored (--ignore-robots)")
         return allow_all(config.user_agent)
-    return load_robots(config.base_url, user_agent=config.user_agent)
+    return load_robots(config.require_base_url(), user_agent=config.user_agent)
 
 
 def _effective_delay(config: Config, robots: Robots) -> float:

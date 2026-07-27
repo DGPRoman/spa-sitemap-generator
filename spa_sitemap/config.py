@@ -15,7 +15,7 @@ import difflib
 import json
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Self
 from urllib.parse import urlsplit
@@ -35,9 +35,15 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class Config:
-    """Everything the crawl and the export need to know."""
+    """Everything the crawl and the export need to know.
 
-    base_url: str
+    ``base_url`` is optional because ``export`` and ``status`` operate on an
+    existing database, not on a site -- requiring a URL to read back what was
+    already crawled would be busywork. The crawl commands ask for it via
+    ``policy()``, which fails with a precise message when it is missing.
+    """
+
+    base_url: str | None = None
 
     # politeness & pacing
     delay: float = 1.0
@@ -76,15 +82,38 @@ class Config:
     # -- construction --------------------------------------------------------
 
     @classmethod
-    def load(cls, path: Path | str = DEFAULT_CONFIG_PATH) -> Self:
+    def from_sources(
+        cls, path: Path | str | None = None, *, must_exist: bool = False, **overrides: Any
+    ) -> Self:
+        """Build a config from an optional file plus explicit overrides.
+
+        The config file is genuinely optional: ``--url https://site/`` is enough to
+        run, so a target URL never has to be written into a file to be crawlable.
+        ``must_exist`` is for when the user named a file explicitly -- silently
+        ignoring a missing ``-c other.json`` would be worse than failing.
+
+        Overrides whose value is ``None`` are treated as "not supplied" and leave
+        the file's value alone.
+        """
+        path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
+        data: dict[str, Any] = {}
+
+        if path.is_file():
+            data.update(cls.read_file(path))
+        elif must_exist:
+            raise ConfigError(f"config file not found: {path}")
+
+        data.update({key: value for key, value in overrides.items() if value is not None})
+        return cls.from_mapping(data)
+
+    @classmethod
+    def read_file(cls, path: Path | str) -> Mapping[str, Any]:
+        """Parse a config file into a raw mapping, without validating it."""
         path = Path(path)
         try:
             raw = path.read_text(encoding="utf-8")
         except FileNotFoundError as exc:
-            raise ConfigError(
-                f"config file not found: {path}. Copy config.example.json to {path} "
-                f"and set 'base_url', or pass --url."
-            ) from exc
+            raise ConfigError(f"config file not found: {path}") from exc
         except OSError as exc:
             raise ConfigError(f"cannot read {path}: {exc}") from exc
 
@@ -95,7 +124,12 @@ class Config:
 
         if not isinstance(data, Mapping):
             raise ConfigError(f"{path} must contain a JSON object, got {type(data).__name__}")
-        return cls.from_mapping(data)
+        return data
+
+    @classmethod
+    def load(cls, path: Path | str = DEFAULT_CONFIG_PATH) -> Self:
+        """Load a config that must exist on disk."""
+        return cls.from_mapping(cls.read_file(path))
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> Self:
@@ -109,9 +143,6 @@ class Config:
                 hint = f"; did you mean '{suggestion}'?" if suggestion else ""
                 raise ConfigError(f"unknown config key '{key}'{hint}")
             kwargs[name] = value
-
-        if "base_url" not in kwargs:
-            raise ConfigError("config must set 'base_url' (the URL to start crawling from)")
 
         return cls(**cls._coerce(kwargs))
 
@@ -132,16 +163,21 @@ class Config:
                 raise ConfigError("window_size must be [width, height]") from exc
         return kwargs
 
-    def with_overrides(self, **overrides: Any) -> Self:
-        """Apply CLI overrides, ignoring the ones that were not supplied."""
-        supplied = {key: value for key, value in overrides.items() if value is not None}
-        return replace(self, **supplied) if supplied else self
-
     # -- derived -------------------------------------------------------------
+
+    def require_base_url(self) -> str:
+        """The crawl target, or a ConfigError naming both ways to supply it."""
+        if not self.base_url:
+            raise ConfigError(
+                "no site to crawl: pass --url https://example.com/, "
+                f"or set 'base_url' in {DEFAULT_CONFIG_PATH} "
+                "(copy config.example.json to start from)"
+            )
+        return self.base_url
 
     def policy(self) -> UrlPolicy:
         return UrlPolicy.build(
-            self.base_url,
+            self.require_base_url(),
             include_subdomains=self.include_subdomains,
             restrict_to_path=self.restrict_to_path,
             keep_query=self.keep_query,
@@ -153,11 +189,12 @@ class Config:
     # -- validation ----------------------------------------------------------
 
     def _validate(self) -> None:
-        parts = urlsplit(self.base_url.strip()) if isinstance(self.base_url, str) else None
-        if parts is None or parts.scheme.lower() not in CRAWLABLE_SCHEMES or not parts.netloc:
-            raise ConfigError(
-                f"base_url must be an absolute http(s) URL, got {self.base_url!r}"
-            )
+        if self.base_url is not None:
+            parts = urlsplit(self.base_url.strip()) if isinstance(self.base_url, str) else None
+            if parts is None or parts.scheme.lower() not in CRAWLABLE_SCHEMES or not parts.netloc:
+                raise ConfigError(
+                    f"base_url must be an absolute http(s) URL, got {self.base_url!r}"
+                )
 
         for name in ("delay", "page_load_timeout", "settle_timeout"):
             value = getattr(self, name)
@@ -189,7 +226,10 @@ class Config:
         # Building the policy compiles exclude_patterns and parses the scope, so a
         # bad regex or an unusable base URL is reported here rather than mid-crawl.
         try:
-            self.policy()
+            if self.base_url is not None:
+                self.policy()
+            else:
+                tuple(re.compile(pattern) for pattern in self.exclude_patterns)
         except (ValueError, re.error) as exc:
             raise ConfigError(str(exc)) from exc
 
