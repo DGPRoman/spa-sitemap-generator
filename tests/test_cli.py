@@ -198,6 +198,16 @@ def test_update_refuses_to_resume_a_different_site(project: Path) -> None:
     assert main(["update", "--url", "https://other.test/"]) == EXIT_ERROR
 
 
+def test_update_accepts_the_same_site_written_differently(project: Path) -> None:
+    """`https://example.com` and `https://example.com/` are one site.
+
+    Compared as raw strings they were not, so resuming your own crawl failed over
+    a missing trailing slash.
+    """
+    crawled(project / "db" / "sitemap.db", {"https://example.com/a": 0})
+    assert main(["update", "--url", "https://example.com"]) == EXIT_OK
+
+
 def test_update_reports_a_finished_crawl_without_starting_a_browser(
     project: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -228,6 +238,60 @@ def test_new_asks_before_discarding_an_existing_crawl(
 
     with UrlStore(project / "db" / "sitemap.db") as store:
         assert store.total() == 1  # nothing was discarded
+
+
+def test_new_refuses_to_destroy_another_sites_crawl(project: Path) -> None:
+    """The reported defect: crawling a second site silently dropped the first.
+
+    Deliberately tested with ``-y`` and without a TTY, because that is where the
+    data went missing -- ``_confirm_discard`` answers itself under cron, and the
+    prompt it skips never named the site anyway.
+    """
+    db = project / "db" / "sitemap.db"
+    crawled(db, {"https://example.com/a": 0, "https://example.com/b": 0})
+
+    assert main(["new", "-y", "--url", "https://other.test/"]) == EXIT_ERROR
+
+    with UrlStore(db) as store:
+        assert store.total() == 2
+        assert store.get_meta("base_url") == "https://example.com/"
+
+
+def test_a_different_path_scope_on_one_host_is_a_different_site(project: Path) -> None:
+    """A crawl is scoped by (scheme, host, port, path prefix), not by host alone."""
+    db = project / "db" / "sitemap.db"
+    crawled(db, {"https://example.com/docs/a": 0})
+    with UrlStore(db) as store:
+        store.set_meta("base_url", "https://example.com/docs/")
+
+    assert main(["new", "-y", "--url", "https://example.com/blog/"]) == EXIT_ERROR
+
+    with UrlStore(db) as store:
+        assert store.total() == 1
+
+
+def test_new_can_be_forced_onto_another_sites_database(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = project / "db" / "sitemap.db"
+    crawled(db, {"https://example.com/a": 0})
+    monkeypatch.setattr(cli, "_run_crawl", lambda *a, **k: EXIT_OK)
+
+    assert main(["new", "-y", "--force", "--url", "https://other.test/"]) == EXIT_OK
+
+    with UrlStore(db) as store:
+        assert store.total() == 0
+        assert store.get_meta("base_url") == "https://other.test/"
+
+
+def test_new_still_re_crawls_the_same_site_unattended(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard must not break the ordinary cron case it sits in front of."""
+    crawled(project / "db" / "sitemap.db", {"https://example.com/a": 0})
+    monkeypatch.setattr(cli, "_run_crawl", lambda *a, **k: EXIT_OK)
+
+    assert main(["new", "-y"]) == EXIT_OK
 
 
 def test_new_does_not_prompt_when_there_is_nothing_to_lose(

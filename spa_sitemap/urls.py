@@ -171,6 +171,25 @@ class Scope:
         return self.include_subdomains and host.endswith("." + self.host)
 
 
+def same_site(one: str, other: str) -> bool:
+    """Do two base URLs describe the same crawl target?
+
+    Compares ``Scope`` values rather than the strings themselves, so
+    ``https://x`` and ``https://x/`` are one site while ``https://x/docs/`` is a
+    different one. That is the question both ``new`` and ``update`` need answered
+    before they touch a database: its rows are keyed by URLs canonicalised under a
+    scope, so a different scope means the stored keys cannot be reused.
+
+    A URL that cannot define a scope at all compares equal to nothing, including
+    an identical unparseable string -- if we cannot tell what a database holds, the
+    caller must not be told it matches.
+    """
+    try:
+        return Scope.from_url(one) == Scope.from_url(other)
+    except ScopeError:
+        return False
+
+
 @dataclass(frozen=True, slots=True)
 class UrlPolicy:
     """Turns a raw ``href`` into the canonical URL to crawl, or ``None`` to drop it."""

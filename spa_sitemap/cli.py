@@ -30,6 +30,7 @@ from spa_sitemap.robots import Robots, allow_all
 from spa_sitemap.robots import load as load_robots
 from spa_sitemap.sitemap import SitemapError, SitemapUrl, entries, write_sitemap
 from spa_sitemap.store import Status, UrlStore
+from spa_sitemap.urls import same_site
 
 log = logging.getLogger("spa_sitemap")
 
@@ -109,7 +110,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     new_parser.add_argument(
         "-y", "--yes", action="store_true",
-        help="do not ask before discarding an existing crawl",
+        help="do not ask before discarding an existing crawl of the same site",
+    )
+    new_parser.add_argument(
+        "--force", action="store_true",
+        help="also allow overwriting a database that belongs to a different site",
     )
     new_parser.set_defaults(func=cmd_new)
     commands.add_parser(
@@ -169,7 +174,21 @@ def cmd_new(args: argparse.Namespace) -> int:
     base_url = config.require_base_url()
     with UrlStore(config.database_path) as store:
         known = store.total()
-        if known and not args.yes and not _confirm_discard(config, known):
+
+        # Before the prompt, and deliberately not subject to -y: discarding your
+        # own crawl to redo it is routine, discarding *another site's* crawl is
+        # always an accident. There is nobody to prompt under cron anyway.
+        other = _conflicting_site(store, base_url) if known else None
+        if other is not None and not args.force:
+            log.error(
+                "%s holds %d URLs for %s, not %s -- crawling would destroy them. "
+                "Use --database to keep the two crawls in separate files, "
+                "or --force to overwrite this one.",
+                config.database_path, known, other, base_url,
+            )
+            return EXIT_ERROR
+
+        if known and not args.yes and not _confirm_discard(config, known, other or base_url):
             log.info("cancelled; use `update` to resume the existing crawl")
             return EXIT_OK
 
@@ -179,12 +198,29 @@ def cmd_new(args: argparse.Namespace) -> int:
         return _run_crawl(config, store, seeds=[base_url])
 
 
-def _confirm_discard(config: Config, known: int) -> bool:
-    """`new` throws away real work, so ask -- unless there is nobody to ask."""
+def _conflicting_site(store: UrlStore, base_url: str) -> str | None:
+    """The site a database already belongs to, when that is not ``base_url``.
+
+    ``None`` means the database is safe to use for ``base_url``: either it records
+    no provenance at all, or it records the same crawl scope.
+    """
+    stored = store.get_meta("base_url")
+    if stored is None or same_site(stored, base_url):
+        return None
+    return stored
+
+
+def _confirm_discard(config: Config, known: int, site: str) -> bool:
+    """`new` throws away real work, so ask -- unless there is nobody to ask.
+
+    A cross-site overwrite has already been refused by the time we get here, so
+    the only question left is whether to re-crawl the same site from scratch --
+    which is exactly what an unattended `new -y` in cron is asking for.
+    """
     if not sys.stdin.isatty():
         return True
     answer = input(
-        f"{config.database_path} already holds {known} URLs. Discard them? [y/N] "
+        f"{config.database_path} already holds {known} URLs for {site}. Discard them? [y/N] "
     )
     return answer.strip().lower() in {"y", "yes"}
 
@@ -213,8 +249,9 @@ def cmd_update(args: argparse.Namespace) -> int:
             log.error("nothing to resume in %s -- run `new` first", config.database_path)
             return EXIT_ERROR
 
-        previous = store.get_meta("base_url")
-        if previous and previous != base_url:
+        # Compared as scopes, not as strings: resuming `https://x/` with
+        # `--url https://x` is the same crawl and used to be rejected outright.
+        if (previous := _conflicting_site(store, base_url)) is not None:
             log.error(
                 "%s was crawled with base_url %s but the config says %s. "
                 "Run `new` to start over, or point --url at the original site.",

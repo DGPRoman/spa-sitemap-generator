@@ -50,7 +50,7 @@ spa-sitemap new
 
 | Command  | Purpose |
 |----------|---------|
-| `new`    | Discard existing crawl data and crawl from scratch. Prompts first if there is data to lose (`-y` skips). |
+| `new`    | Discard existing crawl data and crawl from scratch. Prompts first if there is data to lose (`-y` skips), and refuses outright if the database belongs to a *different* site (`--force` overrides). |
 | `update` | Resume: visit whatever is still queued. Safe to run after a crash or Ctrl-C. |
 | `export` | Write the successfully-crawled URLs to `sitemap.xml`. |
 | `status` | Show counts, and the URLs that failed or were skipped. |
@@ -76,6 +76,24 @@ Exit codes: `0` success, `1` error, `2` bad usage, `130` interrupted.
 
 Pressing Ctrl-C once finishes the page in flight and commits progress, so `update`
 picks up cleanly. Pressing it twice aborts immediately.
+
+## Crawling more than one site
+
+One database holds one site. Give each site its own file:
+
+```bash
+spa-sitemap new --url https://a.example/ --database db/a.db
+spa-sitemap export --database db/a.db -o a.xml
+
+spa-sitemap new --url https://b.example/ --database db/b.db
+spa-sitemap export --database db/b.db -o b.xml
+```
+
+Pointing `new` at a database that already holds another site is an error rather
+than a silent wipe, and that check is deliberately not waived by `-y` — under cron
+there is nobody to prompt, which is exactly where a crawl would otherwise vanish.
+A "site" here is the whole scope, not just the host: `example.com/docs/` and
+`example.com/blog/` are two sites and cannot share a database.
 
 ## Configuration
 

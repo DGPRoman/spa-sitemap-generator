@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from spa_sitemap.urls import Scope, ScopeError, UrlPolicy
+from spa_sitemap.urls import Scope, ScopeError, UrlPolicy, same_site
 
 BASE = "https://example.com/"
 
@@ -245,3 +245,41 @@ def test_normalise_all_dedupes_and_keeps_order(policy: UrlPolicy) -> None:
 
 def test_normalise_all_on_an_empty_page(policy: UrlPolicy) -> None:
     assert policy.normalise_all([], page_url=BASE) == []
+
+
+# -- comparing two base URLs -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("one", "other"),
+    [
+        ("https://example.com/", "https://example.com"),        # trailing slash
+        ("https://example.com/", "https://EXAMPLE.com/"),       # host case
+        ("https://example.com/", "https://example.com:443/"),   # default port
+        ("https://example.com/docs/", "https://example.com/docs/guide.html"),
+    ],
+)
+def test_the_same_site_written_differently(one: str, other: str) -> None:
+    assert same_site(one, other)
+    assert same_site(other, one)
+
+
+@pytest.mark.parametrize(
+    ("one", "other"),
+    [
+        ("https://example.com/", "https://other.test/"),        # different host
+        ("https://example.com/", "https://sub.example.com/"),   # a subdomain is not the site
+        ("https://example.com/", "http://example.com/"),        # different key space
+        ("https://example.com/", "https://example.com:8080/"),  # different port
+        ("https://example.com/docs/", "https://example.com/blog/"),  # scope is not the host
+    ],
+)
+def test_sites_that_must_not_be_treated_as_one(one: str, other: str) -> None:
+    assert not same_site(one, other)
+    assert not same_site(other, one)
+
+
+def test_an_unusable_url_matches_nothing_including_itself() -> None:
+    """If we cannot tell what a database holds, nobody may be told it matches."""
+    assert not same_site("not a url", "not a url")
+    assert not same_site("https://example.com/", "mailto:x@y.z")
