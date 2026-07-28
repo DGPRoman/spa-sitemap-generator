@@ -20,15 +20,16 @@ from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from types import FrameType
-from typing import cast
+from typing import Final, cast
 
-from spa_sitemap import __version__
+from spa_sitemap import __version__, sites
 from spa_sitemap.config import DEFAULT_CONFIG_PATH, Config, ConfigError
 from spa_sitemap.crawler import ABORTED, Crawler, Limits
 from spa_sitemap.renderer import ChromeRenderer
 from spa_sitemap.robots import Robots, allow_all
 from spa_sitemap.robots import load as load_robots
 from spa_sitemap.sitemap import SitemapError, SitemapUrl, entries, write_sitemap
+from spa_sitemap.sites import SiteError
 from spa_sitemap.store import Status, UrlStore
 from spa_sitemap.urls import same_site
 
@@ -56,7 +57,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"config file; must exist if given. Without it, {DEFAULT_CONFIG_PATH} "
              f"is used when present, otherwise --url alone is enough",
     )
-    common.add_argument("--database", type=Path, dest="database_path", help="SQLite file to use")
+    common.add_argument(
+        "--site", metavar="NAME",
+        help="which crawl to act on, when several sites are on disk "
+             "(default: derived from --url, or the only site there is)",
+    )
+    common.add_argument(
+        "--database", type=Path, dest="database_path",
+        help="SQLite file to use, instead of the one derived from the site",
+    )
     common.add_argument(
         "--url", dest="base_url",
         help="the site to crawl; overrides base_url from the config file",
@@ -128,6 +137,9 @@ def build_parser() -> argparse.ArgumentParser:
     commands.add_parser(
         "status", parents=[common], help="show crawl progress"
     ).set_defaults(func=cmd_status)
+    commands.add_parser(
+        "sites", parents=[common], help="list the sites crawled so far"
+    ).set_defaults(func=cmd_sites)
 
     return parser
 
@@ -166,13 +178,80 @@ def _parse_lastmod(value: str | None) -> date | str | None:
         ) from exc
 
 
+# -- where this invocation reads and writes -----------------------------------
+
+
+def _paths(config: Config, site: str | None) -> tuple[Path, Path]:
+    """The database and sitemap this invocation should use.
+
+    Derived rather than configured, so crawling a second site needs no flags and
+    cannot collide with the first. Explicit paths always win; otherwise, in order:
+    ``--site NAME``, the URL's own scope, the pre-``sites/`` layout, or the single
+    site already on disk.
+    """
+    if config.database_path is not None and config.output_path is not None:
+        return config.database_path, config.output_path  # nothing left to work out
+
+    database, output = _derive(config, site)
+    return config.database_path or database, config.output_path or output
+
+
+def _derive(config: Config, site: str | None) -> tuple[Path, Path]:
+    if site is not None:
+        chosen = sites.named(site, sites_dir=config.sites_dir)
+    elif config.base_url:
+        chosen = sites.for_url(
+            config.base_url,
+            sites_dir=config.sites_dir,
+            include_subdomains=config.include_subdomains,
+            restrict_to_path=config.restrict_to_path,
+        )
+        # An upgrade must not orphan a crawl somebody is part-way through -- but
+        # only if that old file is *this* site. If it belongs to another one,
+        # deriving a fresh path is better than handing the user a conflict.
+        if not chosen.database.exists() and _legacy_holds(config.base_url):
+            return _LEGACY_PATHS
+    else:
+        found = sites.existing(config.sites_dir)
+        if len(found) == 1:
+            return found[0].database, found[0].output
+        if not found:
+            if sites.LEGACY_DATABASE.is_file() or config.database_path is not None:
+                return _LEGACY_PATHS
+            raise SiteError(
+                "nothing crawled yet -- run `spa-sitemap new --url https://example.com/`"
+            )
+        # Guessing between them would be a coin toss with somebody's sitemap.
+        listed = "\n  ".join(found_site.slug for found_site in found)
+        raise SiteError(
+            f"{len(found)} sites in {config.sites_dir}/ -- pick one with "
+            f"--site NAME (or --url):\n  {listed}"
+        )
+
+    return chosen.database, chosen.output
+
+
+#: The layout before crawls were kept per site: one database, one sitemap in cwd.
+_LEGACY_PATHS: Final = (sites.LEGACY_DATABASE, Path(sites.OUTPUT_NAME))
+
+
+def _legacy_holds(base_url: str) -> bool:
+    """Is the old ``db/sitemap.db`` a crawl of this same site?"""
+    if not sites.LEGACY_DATABASE.is_file():
+        return False
+    with UrlStore(sites.LEGACY_DATABASE) as store:
+        stored = store.get_meta("base_url")
+    return bool(stored) and same_site(stored or "", base_url)
+
+
 # -- commands ----------------------------------------------------------------
 
 
 def cmd_new(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     base_url = config.require_base_url()
-    with UrlStore(config.database_path) as store:
+    database, _ = _paths(config, args.site)
+    with UrlStore(database) as store:
         known = store.total()
 
         # Before the prompt, and deliberately not subject to -y: discarding your
@@ -181,18 +260,18 @@ def cmd_new(args: argparse.Namespace) -> int:
         other = _conflicting_site(store, base_url) if known else None
         if other is not None and not args.force:
             log.error(
-                "%s holds %d URLs for %s, not %s -- crawling would destroy them. "
-                "Use --database to keep the two crawls in separate files, "
-                "or --force to overwrite this one.",
-                config.database_path, known, other, base_url,
+                "%s holds %s for %s, not %s -- crawling would destroy them. "
+                "Drop --database so each site gets its own file, "
+                "or pass --force to overwrite this one.",
+                database, _urls(known), other, base_url,
             )
             return EXIT_ERROR
 
-        if known and not args.yes and not _confirm_discard(config, known, other or base_url):
+        if known and not args.yes and not _confirm_discard(database, known, other or base_url):
             log.info("cancelled; use `update` to resume the existing crawl")
             return EXIT_OK
 
-        log.info("clearing %s", config.database_path)
+        log.info("crawling %s into %s", base_url, database)
         store.reset()
         store.set_meta("base_url", base_url)
         return _run_crawl(config, store, seeds=[base_url])
@@ -210,7 +289,11 @@ def _conflicting_site(store: UrlStore, base_url: str) -> str | None:
     return stored
 
 
-def _confirm_discard(config: Config, known: int, site: str) -> bool:
+def _urls(count: int) -> str:
+    return f"{count} URL" if count == 1 else f"{count} URLs"
+
+
+def _confirm_discard(database: Path, known: int, site: str) -> bool:
     """`new` throws away real work, so ask -- unless there is nobody to ask.
 
     A cross-site overwrite has already been refused by the time we get here, so
@@ -219,13 +302,11 @@ def _confirm_discard(config: Config, known: int, site: str) -> bool:
     """
     if not sys.stdin.isatty():
         return True
-    answer = input(
-        f"{config.database_path} already holds {known} URLs for {site}. Discard them? [y/N] "
-    )
+    answer = input(f"{database} already holds {_urls(known)} for {site}. Discard them? [y/N] ")
     return answer.strip().lower() in {"y", "yes"}
 
 
-def _with_stored_base_url(config: Config) -> Config:
+def _with_stored_base_url(config: Config, database: Path) -> Config:
     """Fall back to the site the database was crawled with.
 
     `update` resumes an existing crawl, so the target is already recorded in the
@@ -233,20 +314,21 @@ def _with_stored_base_url(config: Config) -> Config:
     """
     if config.base_url:
         return config
-    with UrlStore(config.database_path) as store:
+    with UrlStore(database) as store:
         stored = store.get_meta("base_url")
     return replace(config, base_url=stored) if stored else config
 
 
 def cmd_update(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
+    database, _ = _paths(config, args.site)
     # Resuming needs a target, but the database already recorded one, so the
     # config only has to supply it when it disagrees or is absent.
-    config = _with_stored_base_url(config)
+    config = _with_stored_base_url(config, database)
     base_url = config.require_base_url()
-    with UrlStore(config.database_path) as store:
+    with UrlStore(database) as store:
         if store.total() == 0:
-            log.error("nothing to resume in %s -- run `new` first", config.database_path)
+            log.error("nothing to resume in %s -- run `new` first", database)
             return EXIT_ERROR
 
         # Compared as scopes, not as strings: resuming `https://x/` with
@@ -255,7 +337,7 @@ def cmd_update(args: argparse.Namespace) -> int:
             log.error(
                 "%s was crawled with base_url %s but the config says %s. "
                 "Run `new` to start over, or point --url at the original site.",
-                config.database_path, previous, base_url,
+                database, previous, base_url,
             )
             return EXIT_ERROR
 
@@ -271,8 +353,9 @@ def cmd_update(args: argparse.Namespace) -> int:
 def cmd_export(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
     lastmod = _parse_lastmod(args.lastmod)
+    database, output = _paths(config, args.site)
 
-    with UrlStore(config.database_path) as store:
+    with UrlStore(database) as store:
         entries = _sitemap_entries(store, lastmod)
         pending = store.counts()[Status.QUEUED]
 
@@ -282,7 +365,7 @@ def cmd_export(args: argparse.Namespace) -> int:
             log.error(
                 "no successfully crawled pages in %s -- run `new` first "
                 "(or pass --allow-empty to write an empty sitemap anyway)",
-                config.database_path,
+                database,
             )
             return EXIT_ERROR
 
@@ -293,7 +376,7 @@ def cmd_export(args: argparse.Namespace) -> int:
                 pending,
             )
 
-        result = write_sitemap(entries, config.output_path, base_url=config.base_url)
+        result = write_sitemap(entries, output, base_url=config.base_url)
 
     log.info("export complete: %s", result.describe())
     return EXIT_OK
@@ -307,13 +390,15 @@ def _sitemap_entries(store: UrlStore, lastmod: date | str | None) -> list[Sitema
 
 def cmd_status(args: argparse.Namespace) -> int:
     config = _config_from_args(args)
-    with UrlStore(config.database_path) as store:
+    database, output = _paths(config, args.site)
+    with UrlStore(database) as store:
         counts = store.counts()
         total = store.total()
         problems = store.problems(limit=10)
         crawled_site = store.get_meta("base_url")
 
-    print(f"database : {config.database_path}")
+    print(f"database : {database}")
+    print(f"sitemap  : {output}")
     print(f"base URL : {config.base_url or crawled_site or '(none recorded)'}")
     print(f"known    : {total} URLs")
     for status, count in counts.items():
@@ -322,6 +407,37 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("\nrecent problems:")
         for status, url, note in problems:
             print(f"  [{status}] {url} -- {note}")
+    return EXIT_OK
+
+
+def cmd_sites(args: argparse.Namespace) -> int:
+    """Everything crawled so far, read off the directories themselves.
+
+    No registry file: a registry is a second copy of the truth and drifts the
+    first time somebody deletes a directory.
+    """
+    config = _config_from_args(args)
+    found = sites.existing(config.sites_dir)
+    if sites.LEGACY_DATABASE.is_file():
+        found = [sites.Site(slug="(legacy)", directory=sites.LEGACY_DATABASE.parent), *found]
+
+    if not found:
+        print("no crawls yet -- run `spa-sitemap new --url https://example.com/`")
+        return EXIT_OK
+
+    rows = []
+    for site in found:
+        with UrlStore(site.database) as store:
+            counts = store.counts()
+            rows.append(
+                (site.slug, counts[Status.DONE], counts[Status.QUEUED],
+                 store.get_meta("base_url") or "?")
+            )
+
+    width = max(len(row[0]) for row in rows)
+    print(f"{'site':<{width}}  {'done':>6}  {'queued':>6}  url")
+    for slug, done, queued, url in rows:
+        print(f"{slug:<{width}}  {done:>6}  {queued:>6}  {url}")
     return EXIT_OK
 
 
@@ -445,7 +561,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     started = time.monotonic()
     try:
         return cast("int", args.func(args))
-    except (ConfigError, SitemapError) as exc:
+    except (ConfigError, SitemapError, SiteError) as exc:
         log.error("%s", exc)
         return EXIT_ERROR
     except KeyboardInterrupt:

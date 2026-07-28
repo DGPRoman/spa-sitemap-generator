@@ -29,7 +29,10 @@ def test_loads_a_minimal_config(tmp_path: Path) -> None:
     config = Config.load(write_config(tmp_path, MINIMAL))
     assert config.base_url == "https://example.com/"
     assert config.delay == 1.0
-    assert config.database_path == Path("db/sitemap.db")
+    # Unset on purpose: the paths are derived from the site being crawled, so two
+    # sites cannot land in one file just because nobody passed --database.
+    assert config.database_path is None
+    assert config.output_path is None
 
 
 def test_a_missing_file_names_the_file_and_the_fix(tmp_path: Path) -> None:

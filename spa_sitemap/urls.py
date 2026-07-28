@@ -81,6 +81,11 @@ ASSET_SUFFIXES: Final = frozenset(
 )
 
 
+#: Everything a directory name may not contain. Kept narrow on purpose: the result
+#: is used as a path, so the safe set is the one that cannot mean anything else.
+_UNSAFE_IN_SLUG: Final = re.compile(r"[^a-z0-9._-]+")
+
+
 class ScopeError(ValueError):
     """Raised when a base URL cannot define a crawl scope."""
 
@@ -163,6 +168,33 @@ class Scope:
     @property
     def origin(self) -> str:
         return f"{self.scheme}://{self.netloc}"
+
+    @property
+    def slug(self) -> str:
+        """A filesystem-safe name for this scope, used as its own directory.
+
+        Derived from the whole scope rather than just the host, because the scope
+        is what one database holds: ``example.com/docs/`` and ``example.com/blog/``
+        are two separate crawls and must not collide in one directory. Ports fold
+        in for the same reason -- two dev servers on one host are two sites.
+
+        Sanitised rather than escaped: this becomes a path, so anything outside
+        ``[a-z0-9._-]`` is replaced and leading dots are stripped, which rules out
+        both hidden directories and ``..``.
+        """
+        try:
+            host = self.host.encode("idna").decode("ascii")
+        except UnicodeError:
+            host = self.host  # not a resolvable IDN; sanitising below still applies
+
+        parts = [host]
+        if self.port is not None:
+            parts.append(str(self.port))
+        if self.path_prefix != "/":
+            parts.append(self.path_prefix.strip("/").replace("/", "_"))
+
+        slug = _UNSAFE_IN_SLUG.sub("-", "_".join(parts).lower()).strip("._-")
+        return slug or "site"
 
     def matches_host(self, host: str) -> bool:
         host = host.lower()

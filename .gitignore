@@ -170,3 +170,5 @@ cython_debug/
 sitemap.xml
 sitemap-*.xml
 config.json
+# crawl state and output, one directory per site
+sites/

@@ -54,11 +54,13 @@ spa-sitemap new
 | `update` | Resume: visit whatever is still queued. Safe to run after a crash or Ctrl-C. |
 | `export` | Write the successfully-crawled URLs to `sitemap.xml`. |
 | `status` | Show counts, and the URLs that failed or were skipped. |
+| `sites`  | List the sites crawled so far, with progress and location. |
 
 Useful flags (`spa-sitemap <command> --help` for the full list):
 
 ```
---url URL            override base_url for this run
+--url URL            the site to crawl; also decides where its files go
+--site NAME          which crawl to act on, when several sites exist
 --max-pages N        stop after N pages
 --max-depth N        do not follow links deeper than N
 --max-runtime SEC    stop after SEC seconds
@@ -81,21 +83,44 @@ picks up cleanly. Pressing it twice aborts immediately.
 
 ## Crawling more than one site
 
-One database holds one site. Give each site its own file:
+Nothing to configure — each site gets its own directory, named after its URL:
 
 ```bash
-spa-sitemap new --url https://a.example/ --database db/a.db
-spa-sitemap export --database db/a.db -o a.xml
-
-spa-sitemap new --url https://b.example/ --database db/b.db
-spa-sitemap export --database db/b.db -o b.xml
+spa-sitemap new --url https://a.example/     # sites/a.example/
+spa-sitemap new --url https://b.example/     # sites/b.example/
+spa-sitemap sites                            # what have I crawled?
 ```
 
-Pointing `new` at a database that already holds another site is an error rather
-than a silent wipe, and that check is deliberately not waived by `-y` — under cron
-there is nobody to prompt, which is exactly where a crawl would otherwise vanish.
-A "site" here is the whole scope, not just the host: `example.com/docs/` and
-`example.com/blog/` are two sites and cannot share a database.
+```
+site        done  queued  url
+a.example   1204       0  https://a.example/
+b.example     87      12  https://b.example/
+```
+
+With one site, every command still needs no arguments. With several, say which:
+
+```bash
+spa-sitemap export --site a.example          # -> sites/a.example/sitemap.xml
+spa-sitemap update --url https://b.example/  # a URL identifies a site too
+```
+
+A bare `export` or `status` uses the only site there is, and otherwise lists the
+candidates rather than guessing — a guess here is a coin toss with somebody's
+sitemap. Deleting a site is `rm -rf sites/a.example`; archiving it is `tar`.
+
+A "site" is the whole crawl scope, not just the host, which is why a database
+cannot be named after a hostname: `example.com/docs/` and `example.com/blog/` are
+two crawls and get `sites/example.com_docs/` and `sites/example.com_blog/`. Ports
+count too, so two dev servers on `localhost` do not collide.
+
+`--database` and `-o` still override everything, for anyone who wants to choose
+the layout themselves. They are also the only way back into a shared file — and
+there `new` refuses to overwrite another site's crawl unless you pass `--force`.
+That check is deliberately not waived by `-y`: under cron there is nobody to
+prompt, which is exactly where a crawl would otherwise vanish.
+
+If you already have a `db/sitemap.db` from an earlier version it keeps being used,
+so upgrading does not orphan a crawl you are part-way through.
 
 ## When things go wrong mid-crawl
 
@@ -200,8 +225,9 @@ Command-line flags override file values.
 | `max_attempts` | `3` | Tries per URL before giving up on it. |
 | `max_consecutive_failures` | `10` | Abandon the run after this many failures in a row; `null` disables. |
 | `max_restarts` | `3` | Replacement browsers to try before giving up on the run. |
-| `database_path` | `db/sitemap.db` | Crawl state. |
-| `output_path` | `sitemap.xml` | Sitemap destination. |
+| `database_path` | derived | Crawl state. Setting it turns off the per-site layout. |
+| `output_path` | derived | Sitemap destination. Likewise. |
+| `sites_dir` | `sites` | Where the per-site directories live. |
 
 The original `{"url": ..., "delay": ...}` config still works — `url` is accepted as
 an alias for `base_url`. Unknown keys are rejected with a suggestion, so a typo

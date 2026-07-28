@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from spa_sitemap.urls import Scope, ScopeError, UrlPolicy, same_site
@@ -283,3 +285,50 @@ def test_an_unusable_url_matches_nothing_including_itself() -> None:
     """If we cannot tell what a database holds, nobody may be told it matches."""
     assert not same_site("not a url", "not a url")
     assert not same_site("https://example.com/", "mailto:x@y.z")
+
+
+# -- naming a scope's own directory ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "slug"),
+    [
+        ("https://example.com/", "example.com"),
+        ("https://EXAMPLE.com/", "example.com"),
+        ("https://example.com:8080/", "example.com_8080"),
+        ("https://example.com:443/", "example.com"),        # default port folds away
+        ("http://127.0.0.1:48801/index.html", "127.0.0.1_48801"),
+        # Two scopes on one host must not share a directory -- the reason a slug
+        # cannot simply be the host name.
+        ("https://example.com/docs/", "example.com_docs"),
+        ("https://example.com/blog/guide.html", "example.com_blog"),
+        ("https://example.com/a/b/", "example.com_a_b"),
+    ],
+)
+def test_a_scope_names_its_own_directory(url: str, slug: str) -> None:
+    assert Scope.from_url(url).slug == slug
+
+
+def test_an_international_host_becomes_punycode() -> None:
+    """A directory name has to be ASCII to be portable across filesystems."""
+    assert Scope.from_url("https://приклад.укр/").slug.startswith("xn--")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/../x/",
+        "https://example.com/.hidden/",
+        "https://example.com/..%2F..%2F/",
+        "https://example.com/a b/c'd/",
+        "https://xn--/",
+    ],
+)
+def test_a_slug_is_always_one_harmless_directory_name(url: str) -> None:
+    """The slug becomes a path, so the invariant is that it cannot mean anything
+    but a single child directory: never a separator, never `.` or `..`, and never
+    a leading dot that would hide it."""
+    slug = Scope.from_url(url).slug
+    assert Path(slug).parts == (slug,)
+    assert slug not in {".", ".."}
+    assert not slug.startswith(".")

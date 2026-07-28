@@ -74,9 +74,13 @@ class Config:
     max_consecutive_failures: int | None = 10
     max_restarts: int = 3
 
-    # paths
-    database_path: Path = Path("db/sitemap.db")
-    output_path: Path = Path("sitemap.xml")
+    # paths. Unset by default: they are derived from the site being crawled, so
+    # `new --url a.test` and `new --url b.test` cannot land in the same file. A
+    # value here (from --database/-o or the config file) always wins, which is the
+    # escape hatch for anyone who wants to choose the layout themselves.
+    database_path: Path | None = None
+    output_path: Path | None = None
+    sites_dir: Path = Path("sites")
 
     def __post_init__(self) -> None:
         self._validate()
@@ -154,7 +158,7 @@ class Config:
         for key in ("strip_query_params", "exclude_patterns"):
             if key in kwargs and kwargs[key] is not None:
                 kwargs[key] = tuple(str(item) for item in kwargs[key])
-        for key in ("database_path", "output_path"):
+        for key in ("database_path", "output_path", "sites_dir"):
             if key in kwargs and kwargs[key] is not None:
                 kwargs[key] = Path(str(kwargs[key]))
         if kwargs.get("window_size") is not None:
