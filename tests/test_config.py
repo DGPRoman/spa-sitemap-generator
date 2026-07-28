@@ -235,3 +235,24 @@ def test_a_directory_in_place_of_a_config_is_not_read(tmp_path: Path) -> None:
     (tmp_path / "config.json").mkdir()
     config = Config.from_sources(tmp_path / "config.json", base_url="https://a.test/")
     assert config.base_url == "https://a.test/"
+
+
+def test_the_example_config_is_actually_usable() -> None:
+    """README tells you to `cp config.example.json config.json` and go.
+
+    Nothing else covers that file, so a key renamed in Config or a stale key left
+    in the example would break a new user's very first command -- and only theirs.
+    """
+    config = Config.load(Path(__file__).parent.parent / "config.example.json")
+    assert config.base_url == "https://example.com/"
+    assert config.max_restarts == 3
+    assert config.max_consecutive_failures == 10
+
+
+def test_every_documented_key_appears_in_the_example(tmp_path: Path) -> None:
+    """The example is the discoverable list of settings; drift makes it a liar."""
+    from dataclasses import fields
+
+    example = json.loads((Path(__file__).parent.parent / "config.example.json").read_text())
+    known = {field.name for field in fields(Config)}
+    assert set(example) <= known, f"example has keys Config rejects: {set(example) - known}"
