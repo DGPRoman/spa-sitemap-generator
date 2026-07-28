@@ -104,6 +104,19 @@ browser that dies. Two guards bound the damage:
 
 - **Per URL**, `max_attempts` (default 3) retries a transient failure before the
   URL is recorded as `failed`.
+Which of those applies depends on who is at fault, which the renderer works out
+from what the browser said:
+
+| Fault | Examples | Treated as |
+|-------|----------|------------|
+| The URL | `404`, `410`, a page that never settles | retried only if the status says it is worth it |
+| The site | DNS failure, refused/reset connection, expired certificate | not the URL's problem — see below |
+| The browser | crashed tab, dead chromedriver, invalid session | not the URL's problem — see below |
+
+`408`, `425`, `429` and every `5xx` are retried; other `4xx` are not. Treating
+`429` as permanent used to drop real pages from the sitemap of any site that
+rate-limits mid-crawl.
+
 - **Per run**, `max_consecutive_failures` (default 10) abandons the whole crawl
   once that many renders fail in a row with no success in between. A dead
   chromedriver or an unreachable site fails *every* page it is handed, so without

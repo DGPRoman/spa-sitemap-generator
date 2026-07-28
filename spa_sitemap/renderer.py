@@ -44,10 +44,15 @@ _HTML_MIME_TYPES: Final = frozenset(
 
 
 class RenderError(Exception):
-    """A page could not be rendered.
+    """A page could not be rendered, and the URL is the plausible cause.
 
-    ``retryable`` separates "the network hiccuped, try again" from "this URL is a
+    ``retryable`` separates "the server was busy, try again" from "this URL is a
     404, stop wasting navigations on it".
+
+    This is the base of a small hierarchy because one boolean was answering three
+    different questions -- is *this URL* bad, is *the site* refusing me, or is *my
+    browser* dead? -- and the right response differs for each. Subclassing keeps
+    ``except RenderError`` working everywhere it already appears.
     """
 
     def __init__(self, message: str, *, retryable: bool = True) -> None:
@@ -60,6 +65,91 @@ class NotHtmlError(RenderError):
 
     def __init__(self, message: str) -> None:
         super().__init__(message, retryable=False)
+
+
+class SiteUnavailableError(RenderError):
+    """The site or the network is at fault, not this particular URL.
+
+    DNS failure, refused or reset connections, an expired certificate: none of
+    these say anything about the URL we asked for, and none of them will be fixed
+    by asking for a different one. The distinction matters because spending
+    ``max_attempts`` per URL on a site-wide outage is how a whole frontier turns
+    into permanent failures.
+    """
+
+
+class RendererUnavailableError(RenderError):
+    """The browser died. Nothing about the URL or the site is implied.
+
+    Once chromedriver exits or a tab crashes, *every* subsequent render fails, so
+    blaming the URL in flight is both wrong and destructive.
+    """
+
+
+#: Chrome net-error codes and chromedriver phrases, keyed by who is actually at
+#: fault. Deliberately data rather than logic: the list grows as browsers invent
+#: new ways to fail, and none of it deserves a branch.
+_BROWSER_FAULTS: Final = (
+    "invalid session id",
+    "no such window",
+    "chrome not reachable",
+    "not connected to devtools",
+    "tab crashed",
+    "target crashed",
+    "session deleted",
+    "unable to discover open pages",
+    "chrome failed to start",
+)
+
+_SITE_FAULTS: Final = (
+    "err_name_not_resolved",
+    "err_name_resolution_failed",
+    "err_internet_disconnected",
+    "err_network_changed",
+    "err_network_io_suspended",
+    "err_proxy_connection_failed",
+    "err_connection_refused",
+    "err_connection_reset",
+    "err_connection_closed",
+    "err_connection_aborted",
+    "err_connection_timed_out",
+    "err_connection_failed",
+    "err_address_unreachable",
+    "err_socket_not_connected",
+    "err_empty_response",
+    "err_ssl_protocol_error",
+    "err_ssl_version_or_cipher_mismatch",
+    "err_cert_authority_invalid",
+    "err_cert_common_name_invalid",
+    "err_cert_date_invalid",
+    "err_cert_revoked",
+    "err_cert_invalid",
+)
+
+#: 4xx means "your request was wrong", so another navigation is waste -- except
+#: for these three, where the request was fine and the server was not ready.
+#: Treating 429 as permanent silently truncated the sitemap of any site that
+#: rate-limits mid-crawl: real pages were recorded as failed on the first refusal.
+_RETRYABLE_STATUSES: Final = frozenset({408, 425, 429})
+
+
+def classify(message: str) -> type[RenderError]:
+    """Which kind of failure a browser message describes.
+
+    A pure function on the message text, so every branch is unit-testable without
+    a browser -- which is the only practical way to cover failures that need a
+    dying Chrome to reproduce.
+    """
+    lowered = message.lower()
+    if any(phrase in lowered for phrase in _BROWSER_FAULTS):
+        return RendererUnavailableError
+    if any(phrase in lowered for phrase in _SITE_FAULTS):
+        return SiteUnavailableError
+    return RenderError
+
+
+def status_is_retryable(status: int) -> bool:
+    return status in _RETRYABLE_STATUSES or status >= 500
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,11 +234,18 @@ class ChromeRenderer:
         log.debug("chrome started (headless=%s)", self.headless)
 
     def stop(self) -> None:
-        if self._driver is not None:
-            try:
-                self._driver.quit()
-            finally:
-                self._driver = None
+        if self._driver is None:
+            return
+        try:
+            self._driver.quit()
+        except Exception:
+            # Swallowed on purpose. quit() routinely raises when chromedriver has
+            # already died, and letting that out of __exit__ replaced a fully
+            # successful crawl's summary and exit code with a failure. Failing to
+            # close a browser we are finished with is not the caller's problem.
+            log.debug("chrome did not shut down cleanly", exc_info=True)
+        finally:
+            self._driver = None
 
     @property
     def driver(self) -> WebDriver:
@@ -168,9 +265,10 @@ class ChromeRenderer:
         try:
             driver.get(url)
         except TimeoutException as exc:
+            self._abort_pending_load()
             raise RenderError(f"page load timed out after {self.page_load_timeout}s") from exc
         except WebDriverException as exc:
-            raise RenderError(f"navigation failed: {_brief(exc)}") from exc
+            raise _as_render_error("navigation failed", exc) from exc
 
         self._check_navigated(url, before)
         self._check_response(url)
@@ -185,7 +283,7 @@ class ChromeRenderer:
         except TimeoutException as exc:
             raise RenderError(f"page never settled: {_brief(exc)}") from exc
         except WebDriverException as exc:
-            raise RenderError(f"could not read the DOM: {_brief(exc)}") from exc
+            raise _as_render_error("could not read the DOM", exc) from exc
 
         canonical = page.get("canonical")
         return RenderedPage(
@@ -193,6 +291,21 @@ class ChromeRenderer:
             links=tuple(str(href) for href in page.get("links") or () if href),
             canonical=str(canonical) if canonical else None,
         )
+
+    def _abort_pending_load(self) -> None:
+        """Tell Chrome to stop fetching the page we just gave up on.
+
+        A ``driver.get`` timeout does not cancel the navigation -- Chrome carries on
+        loading, so the abandoned page can still be arriving during the *next*
+        ``get`` and its responses can land in the performance log we are about to
+        read for HTTP status.
+        """
+        from selenium.common.exceptions import WebDriverException
+
+        try:
+            self.driver.execute_script("window.stop();")
+        except WebDriverException:
+            log.debug("could not stop the abandoned page load")
 
     def _wait_until_ready(self) -> None:
         deadline = self.monotonic() + self.settle_timeout
@@ -264,7 +377,7 @@ class ChromeRenderer:
             return
         status, mime_type = response
         if status >= 400:
-            raise RenderError(f"HTTP {status}", retryable=status >= 500)
+            raise RenderError(f"HTTP {status}", retryable=status_is_retryable(status))
         if mime_type.lower() not in _HTML_MIME_TYPES:
             raise NotHtmlError(f"not a document: {mime_type}")
 
@@ -321,6 +434,12 @@ class ChromeRenderer:
             log.debug("performance log unavailable; HTTP status detection is off")
             self.detect_http_errors = False
             return []
+
+
+def _as_render_error(context: str, exc: BaseException) -> RenderError:
+    """Wrap a Selenium exception in whichever ``RenderError`` its message calls for."""
+    detail = _brief(exc)
+    return classify(detail)(f"{context}: {detail}")
 
 
 def _brief(exc: BaseException) -> str:
