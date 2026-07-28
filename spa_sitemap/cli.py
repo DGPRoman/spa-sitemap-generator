@@ -338,6 +338,7 @@ def _run_crawl(config: Config, store: UrlStore, *, seeds: Sequence[str]) -> int:
         max_depth=config.max_depth,
         max_runtime=config.max_runtime,
         max_attempts=config.max_attempts,
+        max_consecutive_failures=config.max_consecutive_failures,
     )
 
     renderer = ChromeRenderer(
@@ -366,7 +367,22 @@ def _run_crawl(config: Config, store: UrlStore, *, seeds: Sequence[str]) -> int:
 
     log.info("crawl finished: %s", stats.summary())
     log.info("counts: %s", store.counts())
-    return EXIT_INTERRUPTED if stats.stop_reason == "interrupted" else EXIT_OK
+
+    if stats.stop_reason == "interrupted":
+        return EXIT_INTERRUPTED
+    if stats.stop_reason == "site-unreachable":
+        # Whatever was queued is still queued, and a caller that treats exit 0 as
+        # "the sitemap is current" would be wrong.
+        log.error("run `update` to carry on once the site is reachable again")
+        return EXIT_ERROR
+    if stats.visited == 0 and stats.failed:
+        # The breaker only fires on a long enough streak, so a small frontier can
+        # drain into failures without ever reaching the threshold. Rendering
+        # nothing at all while failing is not a successful run whatever the reason,
+        # and cron deserves to hear about it.
+        log.error("nothing rendered and %d URLs failed -- see `status`", stats.failed)
+        return EXIT_ERROR
+    return EXIT_OK
 
 
 def _load_robots(config: Config) -> Robots:

@@ -14,6 +14,7 @@ import pytest
 
 from spa_sitemap import cli
 from spa_sitemap.cli import EXIT_ERROR, EXIT_OK, build_parser, main
+from spa_sitemap.crawler import CrawlStats
 from spa_sitemap.store import UrlStore
 
 
@@ -306,6 +307,52 @@ def test_new_does_not_prompt_when_there_is_nothing_to_lose(
     monkeypatch.setattr(cli, "_run_crawl", lambda *a, **k: calls.append("ran") or EXIT_OK)
     assert main(["new"]) == EXIT_OK
     assert calls == ["ran"]
+
+
+# -- what a crawl reports to its caller --------------------------------------
+
+
+class _StubRenderer:
+    def __enter__(self) -> _StubRenderer:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+
+def _crawler_returning(stats: CrawlStats) -> type:
+    class _StubCrawler:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def request_stop(self, reason: str = "") -> None:
+            pass
+
+        def crawl(self, _seeds: object) -> CrawlStats:
+            return stats
+
+    return _StubCrawler
+
+
+@pytest.mark.parametrize(
+    ("stats", "expected"),
+    [
+        (CrawlStats(visited=0, failed=3, stop_reason="site-unreachable"), EXIT_ERROR),
+        # The breaker needs a streak, so a small frontier can drain into failures
+        # without ever reaching the threshold -- still not a successful crawl.
+        (CrawlStats(visited=0, failed=3, stop_reason="frontier-empty"), EXIT_ERROR),
+        (CrawlStats(visited=4, failed=1, stop_reason="frontier-empty"), EXIT_OK),
+        (CrawlStats(visited=0, failed=0, stop_reason="frontier-empty"), EXIT_OK),
+    ],
+)
+def test_the_exit_code_reflects_whether_the_crawl_achieved_anything(
+    project: Path, monkeypatch: pytest.MonkeyPatch, stats: CrawlStats, expected: int
+) -> None:
+    """Exit 0 tells cron the sitemap is current; it must not say so when it isn't."""
+    monkeypatch.setattr(cli, "ChromeRenderer", lambda **_kwargs: _StubRenderer())
+    monkeypatch.setattr(cli, "Crawler", _crawler_returning(stats))
+
+    assert main(["new", "-y", "--ignore-robots"]) == expected
 
 
 # -- logging -----------------------------------------------------------------

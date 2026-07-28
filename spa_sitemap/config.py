@@ -71,6 +71,7 @@ class Config:
     max_depth: int | None = None
     max_runtime: float | None = None
     max_attempts: int = 3
+    max_consecutive_failures: int | None = 10
 
     # paths
     database_path: Path = Path("db/sitemap.db")
@@ -210,6 +211,14 @@ class Config:
 
         if not isinstance(self.max_attempts, int) or self.max_attempts < 1:
             raise ConfigError(f"max_attempts must be an integer >= 1, got {self.max_attempts!r}")
+
+        breaker = self.max_consecutive_failures
+        if breaker is not None and (
+            not isinstance(breaker, int) or isinstance(breaker, bool) or breaker < 1
+        ):
+            raise ConfigError(
+                f"max_consecutive_failures must be an integer >= 1 or null, got {breaker!r}"
+            )
 
         for name in (
             "respect_robots",

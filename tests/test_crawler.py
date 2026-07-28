@@ -57,6 +57,17 @@ class FlakyRenderer:
         return RenderedPage(url=url, links=())
 
 
+class DeadRenderer:
+    """Every call fails, the way it does once chromedriver has died."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def render(self, url: str) -> RenderedPage:
+        self.calls += 1
+        raise RenderError("chrome not reachable")
+
+
 @pytest.fixture
 def store() -> Iterator[UrlStore]:
     with UrlStore(":memory:") as store:
@@ -182,6 +193,88 @@ def test_request_stop_ends_the_crawl_gracefully(store: UrlStore) -> None:
 def test_limits_reject_a_nonsensical_attempt_count() -> None:
     with pytest.raises(ValueError, match="max_attempts"):
         Limits(max_attempts=0)
+
+
+def test_limits_reject_a_nonsensical_breaker_threshold() -> None:
+    with pytest.raises(ValueError, match="max_consecutive_failures"):
+        Limits(max_consecutive_failures=0)
+
+
+# -- the circuit breaker -----------------------------------------------------
+
+
+def test_a_dead_browser_stops_the_run_instead_of_failing_every_url(store: UrlStore) -> None:
+    """The catastrophe this guard exists for.
+
+    Once chromedriver dies every render raises, so without a breaker the loop
+    walks the entire frontier spending ``max_attempts`` on each URL and marking
+    all of them permanently failed -- and because ``claim`` only ever hands out
+    ``queued`` rows, ``update`` then reports an empty frontier and the only way
+    back is a full re-crawl. Stopping early is what keeps the work recoverable.
+    """
+    store.enqueue([f"https://example.com/p{n}" for n in range(50)], depth=0)
+    renderer = DeadRenderer()
+
+    stats = make_crawler(
+        store, renderer, limits=Limits(max_attempts=3, max_consecutive_failures=5)
+    ).crawl()
+
+    assert stats.stop_reason == "site-unreachable"
+    assert renderer.calls == 5  # not 50 URLs x 3 attempts
+
+    counts = store.counts()
+    assert counts[Status.FAILED] == 1  # only the one that exhausted its attempts
+    assert counts[Status.QUEUED] == 49  # the frontier survived the outage
+    assert store.has_pending(max_attempts=3)  # ...so `update` has something to do
+
+
+def test_a_success_resets_the_failure_streak(store: UrlStore) -> None:
+    """Scattered bad pages on a healthy site must never trip the breaker.
+
+    The count is of failures *in a row*: one page rendering proves the browser is
+    alive and the site is answering, which is the whole hypothesis being tested.
+    """
+    urls = [f"https://example.com/p{n}" for n in range(6)]
+    renderer = FakeRenderer(
+        {BASE: [f"/p{n}" for n in range(6)], **{url: [] for url in urls}},
+        failures={url: RenderError("HTTP 500") for url in urls[::2]},
+    )
+
+    stats = make_crawler(
+        store, renderer, limits=Limits(max_attempts=1, max_consecutive_failures=2)
+    ).crawl([BASE])
+
+    assert stats.stop_reason == "frontier-empty"
+    assert stats.failed == 3
+    assert stats.visited == 4  # the seed plus p1, p3, p5
+
+
+def test_a_run_of_downloads_does_not_trip_the_breaker(store: UrlStore) -> None:
+    """`not a document` is a definite answer about a URL, not evidence of an outage."""
+    renderer = FakeRenderer(
+        {BASE: [f"/d{n}" for n in range(5)]},
+        failures={
+            f"https://example.com/d{n}": NotHtmlError("not a document: application/zip")
+            for n in range(5)
+        },
+    )
+
+    stats = make_crawler(store, renderer, limits=Limits(max_consecutive_failures=2)).crawl([BASE])
+
+    assert stats.stop_reason == "frontier-empty"
+    assert stats.skipped == 5
+    assert stats.failed == 0
+
+
+def test_the_breaker_can_be_turned_off(store: UrlStore) -> None:
+    store.enqueue([f"https://example.com/p{n}" for n in range(4)], depth=0)
+
+    stats = make_crawler(
+        store, DeadRenderer(), limits=Limits(max_attempts=1, max_consecutive_failures=None)
+    ).crawl()
+
+    assert stats.stop_reason == "frontier-empty"
+    assert stats.failed == 4
 
 
 # -- failure handling --------------------------------------------------------

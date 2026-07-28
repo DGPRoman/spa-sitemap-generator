@@ -29,9 +29,19 @@ class Limits:
     max_runtime: float | None = None
     max_attempts: int = 3
 
+    #: Render failures in a row, with no success in between, before the whole run
+    #: is abandoned. ``max_attempts`` bounds how often we retry *one* URL; this
+    #: bounds how long we keep trying when the problem is not the URL at all. A
+    #: dead browser or an unreachable site fails every page it is handed, so
+    #: without this guard an outage walks the entire frontier and converts it into
+    #: permanent failures at full speed. ``None`` disables the breaker.
+    max_consecutive_failures: int | None = 10
+
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
+        if self.max_consecutive_failures is not None and self.max_consecutive_failures < 1:
+            raise ValueError("max_consecutive_failures must be at least 1, or None to disable")
 
 
 @dataclass(slots=True)
@@ -94,6 +104,7 @@ class Crawler:
         self._sleep = sleep
         self._monotonic = monotonic
         self._stop_reason: str | None = None
+        self._consecutive_failures = 0
 
     def request_stop(self, reason: str = "interrupted") -> None:
         """Ask the loop to finish after the current page. Safe from a signal handler."""
@@ -146,6 +157,10 @@ class Crawler:
         except RenderError as exc:
             self._handle_failure(page, exc, stats)
             return
+
+        # One page rendering proves the browser is alive and the site is answering,
+        # which is precisely what the breaker below is counting the absence of.
+        self._consecutive_failures = 0
 
         owner = self._resolve_redirect(page, rendered.url, stats)
         if owner is None:
@@ -210,12 +225,29 @@ class Crawler:
         return target
 
     def _handle_failure(self, page: Page, exc: RenderError, stats: CrawlStats) -> None:
-        exhausted = page.attempts >= self.limits.max_attempts
         if isinstance(exc, NotHtmlError):
+            # A definite answer about this URL -- not evidence that anything is
+            # broken, so it must not count towards the circuit breaker.
             self.store.mark_skipped(page.url, str(exc))
             stats.skipped += 1
             log.info("skip: %s (%s)", page.url, exc)
-        elif exc.retryable and not exhausted:
+            return
+
+        self._consecutive_failures += 1
+        if self._breaker_tripped():
+            # Leave this URL queued rather than failing it: the point of stopping
+            # is that the frontier survives the outage intact, so `update` has
+            # something to resume once the site (or the browser) comes back.
+            self.store.requeue(page.url, str(exc))
+            log.error(
+                "%d failures in a row, the last on %s (%s) -- abandoning this run "
+                "with the frontier intact; run `update` to continue",
+                self._consecutive_failures, page.url, exc,
+            )
+            self.request_stop("site-unreachable")
+            return
+
+        if exc.retryable and page.attempts < self.limits.max_attempts:
             self.store.requeue(page.url, str(exc))
             log.warning(
                 "retry %d/%d: %s (%s)", page.attempts, self.limits.max_attempts, page.url, exc
@@ -224,6 +256,10 @@ class Crawler:
             self.store.mark_failed(page.url, str(exc))
             stats.failed += 1
             log.warning("failed: %s (%s)", page.url, exc)
+
+    def _breaker_tripped(self) -> bool:
+        limit = self.limits.max_consecutive_failures
+        return limit is not None and self._consecutive_failures >= limit
 
     # -- control -------------------------------------------------------------
 

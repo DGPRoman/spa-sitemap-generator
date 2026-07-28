@@ -14,6 +14,7 @@
   "max_depth": null,
   "max_runtime": null,
   "max_attempts": 3,
+  "max_consecutive_failures": 10,
   "database_path": "db/sitemap.db",
   "output_path": "sitemap.xml",
   "respect_canonical": true,

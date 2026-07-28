@@ -72,7 +72,9 @@ Useful flags (`spa-sitemap <command> --help` for the full list):
 -v / -q              more or less logging
 ```
 
-Exit codes: `0` success, `1` error, `2` bad usage, `130` interrupted.
+Exit codes: `0` success, `1` error, `2` bad usage, `130` interrupted. A crawl that
+rendered nothing while failing URLs exits `1`, so a cron job cannot mistake a dead
+site for an up-to-date sitemap.
 
 Pressing Ctrl-C once finishes the page in flight and commits progress, so `update`
 picks up cleanly. Pressing it twice aborts immediately.
@@ -94,6 +96,21 @@ than a silent wipe, and that check is deliberately not waived by `-y` — under 
 there is nobody to prompt, which is exactly where a crawl would otherwise vanish.
 A "site" here is the whole scope, not just the host: `example.com/docs/` and
 `example.com/blog/` are two sites and cannot share a database.
+
+## When things go wrong mid-crawl
+
+A crawl that runs for hours will meet a dropped connection, a rate limit, or a
+browser that dies. Two guards bound the damage:
+
+- **Per URL**, `max_attempts` (default 3) retries a transient failure before the
+  URL is recorded as `failed`.
+- **Per run**, `max_consecutive_failures` (default 10) abandons the whole crawl
+  once that many renders fail in a row with no success in between. A dead
+  chromedriver or an unreachable site fails *every* page it is handed, so without
+  this the crawl would walk the entire frontier converting it into permanent
+  failures — and since only `queued` URLs are ever retried, `update` could not
+  recover them. Stopping early leaves the frontier intact, so `update` resumes
+  once the site is back.
 
 ## Configuration
 
@@ -131,6 +148,7 @@ Command-line flags override file values.
 | `exclude_patterns` | `[]` | Regexes; a matching URL is never crawled. |
 | `max_pages`, `max_depth`, `max_runtime` | `null` | Termination guards. |
 | `max_attempts` | `3` | Tries per URL before giving up on it. |
+| `max_consecutive_failures` | `10` | Abandon the run after this many failures in a row; `null` disables. |
 | `database_path` | `db/sitemap.db` | Crawl state. |
 | `output_path` | `sitemap.xml` | Sitemap destination. |
 
