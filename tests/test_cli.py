@@ -1,0 +1,565 @@
+"""CLI wiring and exit codes -- no browser is started in this module.
+
+The old CLI called `args.func()` with no arguments, so no option could ever reach a
+handler, and every path returned exit code 0 regardless of what happened.
+"""
+
+from __future__ import annotations
+
+import json
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import pytest
+
+from spa_sitemap import cli, sites
+from spa_sitemap.cli import EXIT_ERROR, EXIT_OK, build_parser, main
+from spa_sitemap.crawler import CrawlStats
+from spa_sitemap.store import UrlStore
+
+
+@pytest.fixture
+def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A working directory with a valid config.json."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.json").write_text(
+        json.dumps({"base_url": "https://example.com/", "delay": 0}), encoding="utf-8"
+    )
+    return tmp_path
+
+
+def crawled(urls: dict[str, int], *, base_url: str = "https://example.com/") -> Path:
+    """Seed a site's database as though a crawl had visited ``urls``.
+
+    Uses the same derivation the tool does, so a test cannot accidentally assert
+    against a path the CLI would never look at.
+    """
+    site = sites.for_url(base_url)
+    site.directory.mkdir(parents=True, exist_ok=True)
+    with UrlStore(site.database) as store:
+        store.set_meta("base_url", base_url)
+        store.enqueue(urls, depth=0)
+        for url, link_count in urls.items():
+            store.mark_done(url, link_count=link_count)
+    return site.database
+
+
+# -- parsing -----------------------------------------------------------------
+
+
+def test_a_command_is_required(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args([])
+    assert exit_info.value.code == 2
+
+
+def test_an_unknown_command_exits_with_a_usage_error() -> None:
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["frobnicate"])
+    assert exit_info.value.code == 2
+
+
+@pytest.mark.parametrize("command", ["new", "update", "export", "status", "sites"])
+def test_the_documented_commands_all_exist(command: str) -> None:
+    assert build_parser().parse_args([command]).command == command
+
+
+def test_crawl_options_actually_reach_the_namespace() -> None:
+    args = build_parser().parse_args(
+        ["new", "--url", "https://x.test/", "--max-pages", "5", "--max-depth", "2",
+         "--delay", "0.5", "--no-headless", "--ignore-robots", "--wait-for", "#app"]
+    )
+    assert args.base_url == "https://x.test/"
+    assert (args.max_pages, args.max_depth, args.delay) == (5, 2, 0.5)
+    assert args.headless is False
+    assert args.respect_robots is False
+    assert args.wait_for_selector == "#app"
+
+
+def test_unsupplied_flags_stay_none_so_the_config_wins() -> None:
+    """`None` is what tells `from_sources` to leave the config file's value alone."""
+    args = build_parser().parse_args(["new"])
+    assert args.headless is None
+    assert args.respect_robots is None
+    assert args.max_pages is None
+
+
+def test_verbose_and_quiet_are_mutually_exclusive() -> None:
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["status", "-v", "-q"])
+
+
+# -- config errors -----------------------------------------------------------
+
+
+def test_crawling_without_a_config_or_url_is_an_error_not_a_traceback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert main(["new", "-y"]) == EXIT_ERROR
+
+
+def test_an_invalid_config_value_is_an_error(project: Path) -> None:
+    (project / "config.json").write_text(json.dumps({"base_url": "nope"}), encoding="utf-8")
+    assert main(["status"]) == EXIT_ERROR
+
+
+def test_an_unknown_config_key_is_an_error(project: Path) -> None:
+    (project / "config.json").write_text(
+        json.dumps({"base_url": "https://example.com/", "typo": 1}), encoding="utf-8"
+    )
+    assert main(["status"]) == EXIT_ERROR
+
+
+# -- status ------------------------------------------------------------------
+
+
+def test_status_works_on_a_fresh_checkout(project: Path,
+                                          capsys: pytest.CaptureFixture[str]) -> None:
+    """`status` used to be impossible: only `new` ever created the schema."""
+    assert main(["status"]) == EXIT_OK
+    assert "known    : 0 URLs" in capsys.readouterr().out
+
+
+def test_status_reports_counts_and_problems(project: Path,
+                                            capsys: pytest.CaptureFixture[str]) -> None:
+    db = crawled({"https://example.com/a": 1})
+    with UrlStore(db) as store:
+        store.enqueue(["https://example.com/bad"], depth=0)
+        store.mark_failed("https://example.com/bad", "HTTP 404")
+
+    assert main(["status"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "done        1" in out
+    assert "HTTP 404" in out
+
+
+# -- export ------------------------------------------------------------------
+
+
+def test_export_writes_the_visited_urls(project: Path) -> None:
+    crawled({"https://example.com/a": 1, "https://example.com/b": 0})
+
+    assert main(["export"]) == EXIT_OK
+    root = ET.parse(project / "sites" / "example.com" / "sitemap.xml").getroot()
+    locs = [e.text for e in root.iter("{http://www.sitemaps.org/schemas/sitemap/0.9}loc")]
+    assert locs == ["https://example.com/a", "https://example.com/b"]
+
+
+def test_export_fails_instead_of_publishing_an_empty_sitemap(project: Path) -> None:
+    """An empty sitemap tells search engines the site has no pages."""
+    assert main(["export"]) == EXIT_ERROR
+    assert not (project / "sites" / "example.com" / "sitemap.xml").exists()
+
+
+def test_export_can_be_forced_to_write_an_empty_sitemap(project: Path) -> None:
+    assert main(["export", "--allow-empty"]) == EXIT_OK
+    assert (project / "sites" / "example.com" / "sitemap.xml").exists()
+
+
+def test_export_adds_a_per_page_lastmod(project: Path) -> None:
+    from datetime import date
+
+    crawled({"https://example.com/a": 0})
+    assert main(["export", "--lastmod", "visited"]) == EXIT_OK
+
+    root = ET.parse(project / "sites" / "example.com" / "sitemap.xml").getroot()
+    stamps = [e.text for e in root.iter("{http://www.sitemaps.org/schemas/sitemap/0.9}lastmod")]
+    assert stamps == [date.today().isoformat()]
+
+
+def test_export_rejects_a_malformed_lastmod(project: Path) -> None:
+    crawled({"https://example.com/a": 0})
+    assert main(["export", "--lastmod", "last-tuesday"]) == EXIT_ERROR
+
+
+def test_export_warns_that_an_unfinished_crawl_is_incomplete(
+    project: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = crawled({"https://example.com/a": 1})
+    with UrlStore(db) as store:
+        store.enqueue(["https://example.com/queued"], depth=1)
+
+    assert main(["export"]) == EXIT_OK
+    # Asserted on stderr rather than via caplog: the package logger does not
+    # propagate to root, so what the user sees is the only honest thing to check.
+    assert "still queued" in capsys.readouterr().err
+
+
+# -- update ------------------------------------------------------------------
+
+
+def test_update_on_an_empty_database_is_an_error(project: Path) -> None:
+    assert main(["update"]) == EXIT_ERROR
+
+
+def test_update_refuses_to_resume_a_different_site(project: Path) -> None:
+    crawled({"https://example.com/a": 0})
+    assert main(["update", "--url", "https://other.test/"]) == EXIT_ERROR
+
+
+def test_update_accepts_the_same_site_written_differently(project: Path) -> None:
+    """`https://example.com` and `https://example.com/` are one site.
+
+    Compared as raw strings they were not, so resuming your own crawl failed over
+    a missing trailing slash.
+    """
+    crawled({"https://example.com/a": 0})
+    assert main(["update", "--url", "https://example.com"]) == EXIT_OK
+
+
+def test_update_reports_a_finished_crawl_without_starting_a_browser(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    crawled({"https://example.com/a": 0})
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a browser must not be started when nothing is queued")
+
+    monkeypatch.setattr(cli, "ChromeRenderer", explode)
+    assert main(["update"]) == EXIT_OK
+
+
+# -- new ---------------------------------------------------------------------
+
+
+def test_new_asks_before_discarding_an_existing_crawl(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    db = crawled({"https://example.com/a": 0})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+    def explode(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the crawl must not start after declining")
+
+    monkeypatch.setattr(cli, "ChromeRenderer", explode)
+    assert main(["new"]) == EXIT_OK
+
+    with UrlStore(db) as store:
+        assert store.total() == 1  # nothing was discarded
+
+
+def test_new_refuses_to_destroy_another_sites_crawl(project: Path) -> None:
+    """The reported defect: crawling a second site silently dropped the first.
+
+    Two sites now get two directories without being asked, so the only way back
+    into this collision is pointing --site at another site's crawl. Deliberately
+    tested with ``-y`` and without a TTY, because that is where the data went
+    missing: ``_confirm_discard`` answers itself under cron, and the prompt it
+    skips never named the site anyway.
+    """
+    db = crawled({"https://example.com/a": 0, "https://example.com/b": 0})
+
+    args = ["new", "-y", "--site", "example.com", "--url", "https://other.test/"]
+    assert main(args) == EXIT_ERROR
+
+    with UrlStore(db) as store:
+        assert store.total() == 2
+        assert store.get_meta("base_url") == "https://example.com/"
+
+
+def test_two_path_scopes_on_one_host_get_two_directories(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A crawl is scoped by (scheme, host, port, path prefix), not by host alone.
+
+    This is the case that rules out naming a database after the host: `/docs/` and
+    `/blog/` are two crawls and would otherwise silently share one file.
+    """
+    monkeypatch.setattr(cli, "_run_crawl", lambda *a, **k: EXIT_OK)
+
+    assert main(["new", "-y", "--url", "https://example.com/docs/"]) == EXIT_OK
+    assert main(["new", "-y", "--url", "https://example.com/blog/"]) == EXIT_OK
+
+    assert (project / "sites" / "example.com_docs" / "sitemap.db").is_file()
+    assert (project / "sites" / "example.com_blog" / "sitemap.db").is_file()
+
+
+def test_a_second_site_needs_no_flags_and_leaves_the_first_alone(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of deriving the path: no --database to remember.
+
+    Before, the two crawls shared one file, so this either destroyed the first
+    site or -- once that was guarded -- refused to run until the user supplied a
+    path by hand.
+    """
+    first = crawled({"https://example.com/a": 0})
+    monkeypatch.setattr(cli, "_run_crawl", lambda *a, **k: EXIT_OK)
+
+    assert main(["new", "-y", "--url", "https://other.test/"]) == EXIT_OK
+
+    with UrlStore(first) as store:
+        assert store.total() == 1  # untouched
+        assert store.get_meta("base_url") == "https://example.com/"
+    with UrlStore(project / "sites" / "other.test" / "sitemap.db") as store:
+        assert store.get_meta("base_url") == "https://other.test/"
+
+
+def test_force_overrides_the_guard(project: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Reusing one site's directory for another is still possible, just not silent."""
+    db = crawled({"https://example.com/a": 0})
+    monkeypatch.setattr(cli, "_run_crawl", lambda *a, **k: EXIT_OK)
+
+    args = ["new", "-y", "--site", "example.com", "--url", "https://other.test/", "--force"]
+    assert main(args) == EXIT_OK
+
+    with UrlStore(db) as store:
+        assert store.total() == 0
+        assert store.get_meta("base_url") == "https://other.test/"
+
+
+def test_new_still_re_crawls_the_same_site_unattended(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard must not break the ordinary cron case it sits in front of."""
+    crawled({"https://example.com/a": 0})
+    monkeypatch.setattr(cli, "_run_crawl", lambda *a, **k: EXIT_OK)
+
+    assert main(["new", "-y"]) == EXIT_OK
+
+
+def test_new_does_not_prompt_when_there_is_nothing_to_lose(
+    project: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr(
+        "builtins.input", lambda _prompt: pytest.fail("must not prompt on an empty database")
+    )
+
+    calls: list[str] = []
+    monkeypatch.setattr(cli, "_run_crawl", lambda *a, **k: calls.append("ran") or EXIT_OK)
+    assert main(["new"]) == EXIT_OK
+    assert calls == ["ran"]
+
+
+# -- what a crawl reports to its caller --------------------------------------
+
+
+class _StubRenderer:
+    def __enter__(self) -> _StubRenderer:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
+
+
+def _crawler_returning(stats: CrawlStats) -> type:
+    class _StubCrawler:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def request_stop(self, reason: str = "") -> None:
+            pass
+
+        def crawl(self, _seeds: object) -> CrawlStats:
+            return stats
+
+    return _StubCrawler
+
+
+@pytest.mark.parametrize(
+    ("stats", "expected"),
+    [
+        (CrawlStats(visited=0, failed=3, stop_reason="site-unreachable"), EXIT_ERROR),
+        # The breaker needs a streak, so a small frontier can drain into failures
+        # without ever reaching the threshold -- still not a successful crawl.
+        (CrawlStats(visited=0, failed=3, stop_reason="frontier-empty"), EXIT_ERROR),
+        (CrawlStats(visited=4, failed=1, stop_reason="frontier-empty"), EXIT_OK),
+        (CrawlStats(visited=0, failed=0, stop_reason="frontier-empty"), EXIT_OK),
+    ],
+)
+def test_the_exit_code_reflects_whether_the_crawl_achieved_anything(
+    project: Path, monkeypatch: pytest.MonkeyPatch, stats: CrawlStats, expected: int
+) -> None:
+    """Exit 0 tells cron the sitemap is current; it must not say so when it isn't."""
+    monkeypatch.setattr(cli, "ChromeRenderer", lambda **_kwargs: _StubRenderer())
+    monkeypatch.setattr(cli, "Crawler", _crawler_returning(stats))
+
+    assert main(["new", "-y", "--ignore-robots"]) == expected
+
+
+# -- logging -----------------------------------------------------------------
+
+
+def test_configure_logging_does_not_duplicate_handlers() -> None:
+    """The old logger module added a handler on every import."""
+    import logging
+
+    cli.configure_logging()
+    cli.configure_logging(verbose=True)
+    assert len(logging.getLogger("spa_sitemap").handlers) == 1
+
+
+# -- the config file is optional ---------------------------------------------
+
+
+def test_url_alone_runs_without_a_config_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The old error told you to "pass --url" while refusing to run without a file."""
+    monkeypatch.chdir(tmp_path)
+    seen: list[str] = []
+    monkeypatch.setattr(
+        cli, "_run_crawl", lambda config, store, **kw: seen.append(config.base_url) or EXIT_OK
+    )
+
+    assert main(["new", "--url", "https://cli-only.test/", "-y"]) == EXIT_OK
+    assert seen == ["https://cli-only.test/"]
+    assert not (tmp_path / "config.json").exists()
+
+
+def test_no_config_and_no_url_explains_both_options(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert main(["new", "-y"]) == EXIT_ERROR
+    err = capsys.readouterr().err
+    assert "--url" in err and "base_url" in err
+
+
+def test_export_needs_no_config_and_no_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exporting reads back an existing crawl; demanding the URL again is busywork."""
+    monkeypatch.chdir(tmp_path)
+    crawled({"https://recorded.test/a": 0}, base_url="https://recorded.test/")
+
+    assert main(["export"]) == EXIT_OK
+    root = ET.parse(tmp_path / "sites" / "recorded.test" / "sitemap.xml").getroot()
+    locs = [e.text for e in root.iter("{http://www.sitemaps.org/schemas/sitemap/0.9}loc")]
+    assert locs == ["https://recorded.test/a"]
+
+
+def test_status_needs_no_config_and_reports_the_recorded_site(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    crawled({"https://example.com/a": 0})
+
+    assert main(["status"]) == EXIT_OK
+    assert "https://example.com/" in capsys.readouterr().out
+
+
+def test_update_takes_the_site_from_the_database(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    db = crawled({"https://example.com/a": 0})
+    with UrlStore(db) as store:
+        store.enqueue(["https://example.com/queued"], depth=1)
+
+    seen: list[str | None] = []
+    monkeypatch.setattr(
+        cli, "_run_crawl", lambda config, store, **kw: seen.append(config.base_url) or EXIT_OK
+    )
+    assert main(["update"]) == EXIT_OK
+    assert seen == ["https://example.com/"]
+
+
+def test_an_explicitly_named_missing_config_is_an_error(project: Path) -> None:
+    assert main(["status", "-c", "does-not-exist.json"]) == EXIT_ERROR
+
+
+def test_an_alternate_config_file_is_honoured(project: Path,
+                                              capsys: pytest.CaptureFixture[str]) -> None:
+    (project / "other.json").write_text(
+        json.dumps({"base_url": "https://other.test/"}), encoding="utf-8"
+    )
+    assert main(["status", "-c", "other.json"]) == EXIT_OK
+    assert "https://other.test/" in capsys.readouterr().out
+
+
+# -- one site per file, without being asked ----------------------------------
+
+
+def _fresh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A working directory with no config and no previous crawl."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(cli, "_run_crawl", lambda *a, **k: EXIT_OK)
+    return tmp_path
+
+
+def test_the_url_alone_decides_where_the_crawl_lives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _fresh(tmp_path, monkeypatch)
+    assert main(["new", "-y", "--url", "https://a.test/"]) == EXIT_OK
+    assert (root / "sites" / "a.test" / "sitemap.db").is_file()
+
+
+def test_export_and_status_find_the_only_site_without_being_told(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The single-site case must stay argument-free -- that is the whole UX."""
+    root = _fresh(tmp_path, monkeypatch)
+    db = root / "sites" / "a.test" / "sitemap.db"
+    db.parent.mkdir(parents=True)
+    with UrlStore(db) as store:
+        store.set_meta("base_url", "https://a.test/")
+        store.enqueue(["https://a.test/x"], depth=0)
+        store.mark_done("https://a.test/x", link_count=0)
+
+    assert main(["status"]) == EXIT_OK
+    assert "a.test" in capsys.readouterr().out
+
+    assert main(["export"]) == EXIT_OK
+    assert (root / "sites" / "a.test" / "sitemap.xml").is_file()
+
+
+def test_several_sites_make_a_bare_command_ask_which(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Guessing between them would be a coin toss with somebody's sitemap."""
+    root = _fresh(tmp_path, monkeypatch)
+    for slug in ("a.test", "b.test"):
+        (root / "sites" / slug).mkdir(parents=True)
+        with UrlStore(root / "sites" / slug / "sitemap.db") as store:
+            store.set_meta("base_url", f"https://{slug}/")
+
+    assert main(["status"]) == EXIT_ERROR
+    listed = capsys.readouterr().err
+    assert "a.test" in listed and "b.test" in listed
+
+    assert main(["status", "--site", "b.test"]) == EXIT_OK
+    assert "b.test" in capsys.readouterr().out
+
+
+def test_a_dangerous_site_name_is_refused_not_sanitised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fresh(tmp_path, monkeypatch)
+    assert main(["status", "--site", "../../etc"]) == EXIT_ERROR
+
+
+def test_nothing_crawled_yet_says_what_to_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _fresh(tmp_path, monkeypatch)
+    assert main(["export"]) == EXIT_ERROR
+    assert "nothing crawled yet" in capsys.readouterr().err
+
+
+def test_sites_lists_what_has_been_crawled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    root = _fresh(tmp_path, monkeypatch)
+    (root / "sites" / "a.test").mkdir(parents=True)
+    with UrlStore(root / "sites" / "a.test" / "sitemap.db") as store:
+        store.set_meta("base_url", "https://a.test/")
+        store.enqueue(["https://a.test/x", "https://a.test/y"], depth=0)
+        store.mark_done("https://a.test/x", link_count=0)
+
+    assert main(["sites"]) == EXIT_OK
+    out = capsys.readouterr().out
+    assert "a.test" in out
+    assert "https://a.test/" in out
+
+
+def test_sites_on_a_fresh_checkout_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _fresh(tmp_path, monkeypatch)
+    assert main(["sites"]) == EXIT_OK
+    assert "no crawls yet" in capsys.readouterr().out

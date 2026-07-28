@@ -1,0 +1,21 @@
+{
+  "base_url": "https://example.com/",
+  "delay": 1.0,
+  "respect_robots": true,
+  "headless": true,
+  "page_load_timeout": 30.0,
+  "settle_timeout": 8.0,
+  "wait_for_selector": null,
+  "include_subdomains": false,
+  "restrict_to_path": true,
+  "keep_query": true,
+  "exclude_patterns": [],
+  "max_pages": null,
+  "max_depth": null,
+  "max_runtime": null,
+  "max_attempts": 3,
+  "max_consecutive_failures": 10,
+  "max_restarts": 3,
+  "respect_canonical": true,
+  "hash_routing": false
+}
