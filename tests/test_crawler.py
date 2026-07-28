@@ -8,10 +8,12 @@ launching Chrome.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from typing import cast
 
 import pytest
+from conftest import FakeClock
 
-from spa_sitemap.crawler import Crawler, CrawlStats, Limits
+from spa_sitemap.crawler import Crawler, CrawlStats, Limits, RetryPolicy
 from spa_sitemap.renderer import (
     NotHtmlError,
     RenderedPage,
@@ -106,19 +108,23 @@ class UnreachableRenderer:
 
 @pytest.fixture
 def store() -> Iterator[UrlStore]:
-    with UrlStore(":memory:") as store:
+    with UrlStore(":memory:", now=FakeClock()) as store:
         yield store
 
 
 def make_crawler(store: UrlStore, renderer: object, **kwargs: object) -> Crawler:
     """A crawler whose clock and sleep never touch real time."""
-    ticks = iter(range(0, 10_000))
+    ticks = iter(range(0, 100_000))
+    # Reached through the store so that 30-odd call sites need not each be handed
+    # the clock: the point is that sleeping and scheduling share one timeline.
+    clock = cast("FakeClock", store._now)
     return Crawler(
         store=store,
         renderer=renderer,  # type: ignore[arg-type]
         policy=kwargs.pop("policy", None) or UrlPolicy.build(BASE),
-        sleep=lambda _seconds: None,
+        sleep=clock.advance,
         monotonic=lambda: float(next(ticks)),
+        spread=lambda: 0.5,  # the middle of the jitter band, so delays are exact
         **kwargs,  # type: ignore[arg-type]
     )
 
@@ -258,9 +264,12 @@ def test_a_dead_browser_stops_the_run_instead_of_failing_every_url(store: UrlSto
     assert stats.stop_reason == "site-unreachable"
     assert renderer.calls == 5  # not 50 URLs x 3 attempts
 
+    # Nothing at all was written off. Backoff is what buys the last of that: the
+    # first failure holds p0 back, so the streak spreads over five *different*
+    # URLs at one attempt each instead of exhausting one URL three times over.
     counts = store.counts()
-    assert counts[Status.FAILED] == 1  # only the one that exhausted its attempts
-    assert counts[Status.QUEUED] == 49  # the frontier survived the outage
+    assert counts[Status.FAILED] == 0
+    assert counts[Status.QUEUED] == 50
     assert store.has_pending(max_attempts=3)  # ...so `update` has something to do
 
 
@@ -698,3 +707,81 @@ def test_canonical_handling_can_be_turned_off(store: UrlStore) -> None:
 
     assert set(store.visited_urls()) == {BASE}
     assert stats.duplicates == 0
+
+
+# -- the retry schedule ------------------------------------------------------
+
+
+def test_the_backoff_curve_grows_and_is_capped() -> None:
+    policy = RetryPolicy(base=2.0, factor=4.0, cap=30.0, jitter=0.0)
+    assert [policy.delay(n) for n in (1, 2, 3, 4)] == [2.0, 8.0, 30.0, 30.0]
+
+
+def test_a_zero_base_disables_the_schedule() -> None:
+    """Nothing to wait for is a legitimate configuration, not a degenerate one."""
+    assert RetryPolicy(base=0).delay(3) == 0.0
+
+
+def test_jitter_spreads_a_wave_of_failures() -> None:
+    """URLs that failed together must not all come back in the same instant."""
+    policy = RetryPolicy(base=10.0, factor=1.0, cap=100.0, jitter=0.5)
+    assert policy.delay(1, spread=0.0) == 5.0
+    assert policy.delay(1, spread=0.5) == 10.0
+    assert policy.delay(1, spread=1.0) == 15.0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [{"base": -1}, {"factor": 0.5}, {"cap": -1}, {"jitter": 1.0}, {"jitter": -0.1}],
+)
+def test_a_nonsensical_retry_policy_is_refused(kwargs: dict[str, float]) -> None:
+    with pytest.raises(ValueError, match="retry policy"):
+        RetryPolicy(**kwargs)
+
+
+def test_a_failure_moves_the_loop_on_instead_of_hammering_one_url(store: UrlStore) -> None:
+    """The whole point of scheduling the retry rather than sleeping on it.
+
+    Before, `requeue` left discovered_at alone, so `claim` handed the same URL
+    straight back and it burnt every attempt in a row -- which is how a two-second
+    blip used to cost a page permanently.
+    """
+    sick, healthy = "https://example.com/a", "https://example.com/b"
+    renderer = FakeRenderer(
+        {BASE: ["/a", "/b"], healthy: []},
+        failures={sick: RenderError("HTTP 503")},
+    )
+    make_crawler(store, renderer, limits=Limits(max_attempts=3)).crawl([BASE])
+
+    # /b renders *between* /a's attempts. Without the schedule, `claim` handed /a
+    # straight back and /b waited behind three consecutive failures of /a.
+    assert renderer.rendered[:4] == [BASE, sick, healthy, sick]
+    assert renderer.rendered.count(sick) == 3  # still bounded by max_attempts
+
+
+def test_a_deferred_url_is_still_reached_once_it_is_due(store: UrlStore) -> None:
+    renderer = FlakyRenderer(BASE, fail_times=2)
+    stats = make_crawler(store, renderer, limits=Limits(max_attempts=3)).crawl([BASE])
+
+    assert renderer.calls == 3
+    assert stats.visited == 1
+    assert stats.stop_reason == "frontier-empty"
+
+
+def test_an_all_deferred_frontier_is_not_reported_as_empty(store: UrlStore) -> None:
+    """`claim` returning nothing does not mean there is nothing left to do.
+
+    Calling it "frontier-empty" would recreate the contradiction `export` and
+    `update` used to have, where one says work remains and the other says it does
+    not. The clock here never advances, so the deferred URL never becomes due.
+    """
+    store.enqueue([BASE], depth=0)
+    renderer = FakeRenderer({}, failures={BASE: RenderError("HTTP 503")})
+    crawler = make_crawler(store, renderer, limits=Limits(max_attempts=3))
+    crawler.MAX_IDLE_WAITS = 2  # type: ignore[misc]
+    crawler._sleep = lambda _seconds: None  # a clock that does not move
+
+    stats = crawler.crawl()
+
+    assert stats.stop_reason == "still-backing-off"
+    assert store.has_pending(max_attempts=3)  # ...and `update` can still finish it

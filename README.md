@@ -105,7 +105,7 @@ renderer works out from what the browser said:
 
 | Fault | Examples | The URL pays | The run pays |
 |-------|----------|--------------|--------------|
-| The URL | `404`, `410`, a page that never settles | one attempt; `failed` once they run out | nothing |
+| The URL | `404`, `410`, a page that never settles | one attempt, then a growing wait; `failed` once they run out | nothing |
 | The site | DNS failure, refused or reset connection, expired certificate | nothing — its attempt is refunded | counts towards `max_consecutive_failures` |
 | The browser | crashed tab, dead chromedriver, invalid session | nothing — its attempt is refunded | costs one of `max_restarts` |
 
@@ -127,6 +127,17 @@ Three limits bound the damage:
   one run will start. A dead browser is bounded here rather than by the failure
   streak, because a crash says nothing about the site.
 
+A retry is *scheduled*, not slept on. The wait is stored on the row, so the loop
+moves straight on to other URLs instead of blocking on one sick page — and a wait
+kept only in memory would be erased by exactly the crash it exists to survive,
+sending the next run straight back at the same URL. Waits grow 2s, 8s, 32s… to a
+five-minute ceiling, with ±25% jitter so a wave of URLs that failed together does
+not return in lockstep. A site-wide failure is paced rather than escalated:
+deciding when to give up on a site is `max_consecutive_failures`' job, and an
+escalating curve there fights it — measured against a real dead server it reached
+the ceiling within a handful of failures and stalled the run for minutes before
+abandoning a site it already knew was unreachable.
+
 The refund matters more than it sounds. `claim` counts an attempt *before*
 rendering, which is what stops a page that crashes Chrome from being retried for
 ever — but when the browser or the site was at fault the URL never got a fair
@@ -137,6 +148,19 @@ frontier nothing: everything not yet rendered is still `queued`.
 Browser restarts are counted in the crawl summary, because an automatic recovery
 is a quiet degradation — a run that replaced Chrome forty times should not read as
 identical to one that never did.
+
+A crawl that ends with every remaining URL still waiting out a backoff stops with
+`still-backing-off` and exits `1`, rather than claiming the frontier was empty.
+Reporting otherwise would recreate the contradiction where one command insists
+work remains and another insists it does not.
+
+## The database
+
+`db/sitemap.db` carries a schema version. An older file is migrated forward in
+place on open — add-column only, so a migration never rewrites a table full of
+your crawl — and a file written by a *newer* build is refused rather than opened,
+because the alternative is silently downgrading a database somebody is still
+using.
 
 ## Configuration
 

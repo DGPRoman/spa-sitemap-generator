@@ -11,14 +11,17 @@ survived the earlier read-then-filter approach.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 from enum import StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import Final, Self
+
+log = logging.getLogger(__name__)
 
 
 class Status(StrEnum):
@@ -40,21 +43,30 @@ class Status(StrEnum):
     DUPLICATE = "duplicate"
 
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 
 _SCHEMA: Final = f"""
 CREATE TABLE IF NOT EXISTS pages (
-    url           TEXT    PRIMARY KEY,
-    status        TEXT    NOT NULL DEFAULT '{Status.QUEUED}'
-                          CHECK (status IN {tuple(s.value for s in Status)!r}),
-    depth         INTEGER NOT NULL DEFAULT 0,
-    attempts      INTEGER NOT NULL DEFAULT 0,
-    link_count    INTEGER,
-    note          TEXT,
-    discovered_at TEXT    NOT NULL DEFAULT (datetime('now')),
-    visited_at    TEXT
+    url             TEXT    PRIMARY KEY,
+    status          TEXT    NOT NULL DEFAULT '{Status.QUEUED}'
+                            CHECK (status IN {tuple(s.value for s in Status)!r}),
+    depth           INTEGER NOT NULL DEFAULT 0,
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    link_count      INTEGER,
+    note            TEXT,
+    discovered_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+    visited_at      TEXT,
+    -- NULL means "claimable now". A timestamp defers the URL, so a failure backs
+    -- off in the frontier instead of in a sleep() -- backoff held in memory is
+    -- erased by exactly the kill it exists to survive, and sleeping would block
+    -- the loop on one bad URL while thousands of good ones wait.
+    next_attempt_at TEXT
 ) WITHOUT ROWID;
 
+-- Deliberately not extended with next_attempt_at: that is an inequality, and
+-- putting it between `status` and the ORDER BY columns would stop SQLite using
+-- this index to satisfy `ORDER BY depth, discovered_at, url`. Deferred rows are
+-- rare, so filtering them during the ordered scan is cheaper than losing the sort.
 CREATE INDEX IF NOT EXISTS idx_pages_frontier
     ON pages (status, depth, discovered_at);
 
@@ -63,6 +75,31 @@ CREATE TABLE IF NOT EXISTS meta (
     value TEXT NOT NULL
 );
 """
+
+
+def _migrate_to_2(conn: sqlite3.Connection) -> None:
+    """Add the retry schedule. NULL means due now, so every existing row is due."""
+    if not _has_column(conn, "pages", "next_attempt_at"):
+        conn.execute("ALTER TABLE pages ADD COLUMN next_attempt_at TEXT")
+
+
+#: Applied in key order to bring an older file up to ``SCHEMA_VERSION``. Add-column
+#: only, so a migration never rewrites a table full of a user's crawl.
+_MIGRATIONS: Final[dict[int, Callable[[sqlite3.Connection], None]]] = {2: _migrate_to_2}
+
+
+def _has_column(conn: sqlite3.Connection, table: str, column: str) -> bool:
+    """Migrations must be safe to re-run: ALTER TABLE cannot add a column twice."""
+    return any(row["name"] == column for row in conn.execute(f"PRAGMA table_info({table})"))
+
+
+def _stamp(moment: datetime) -> str:
+    """SQLite's own ``datetime('now')`` text format.
+
+    Written the same way so ``next_attempt_at`` can be compared as text -- the
+    format sorts lexicographically, which is why it is safe.
+    """
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,9 +124,13 @@ class UrlStore:
             store.enqueue(["https://example.com/"], depth=0)
     """
 
-    def __init__(self, path: Path | str) -> None:
+    def __init__(self, path: Path | str, *, now: Callable[[], datetime] | None = None) -> None:
         self.path = Path(path)
         self._conn: sqlite3.Connection | None = None
+        # Injected so retry scheduling is testable without waiting: a fake clock
+        # driven by the crawler's fake sleep resolves deferrals instantly and
+        # deterministically. UTC because that is what SQLite's datetime('now') is.
+        self._now = now or (lambda: datetime.now(UTC))
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -135,7 +176,48 @@ class UrlStore:
 
     def create_schema(self) -> None:
         self.conn.executescript(_SCHEMA)
-        self.set_meta("schema_version", str(SCHEMA_VERSION))
+        self._reconcile_version()
+
+    def _reconcile_version(self) -> None:
+        """Migrate an older file forward, or refuse to touch a newer one.
+
+        This used to stamp ``schema_version`` unconditionally, so an older build
+        opening a newer database left the newer tables in place and rewrote the
+        marker *down* -- after which the next upgrade would re-run a migration that
+        had already happened. Read before writing, and never assume.
+        """
+        stored = self.get_meta("schema_version")
+        if stored is None:
+            self.set_meta("schema_version", str(SCHEMA_VERSION))
+            return
+
+        try:
+            version = int(stored)
+        except ValueError as exc:
+            raise StoreError(
+                f"{self.path} has an unreadable schema version {stored!r}"
+            ) from exc
+
+        if version > SCHEMA_VERSION:
+            raise StoreError(
+                f"{self.path} was written by a newer spa-sitemap (schema v{version}; "
+                f"this build understands v{SCHEMA_VERSION}). Upgrade, or use a different "
+                "--database rather than risking the crawl in this one."
+            )
+        if version == SCHEMA_VERSION:
+            return
+
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            for step in range(version + 1, SCHEMA_VERSION + 1):
+                if (migration := _MIGRATIONS.get(step)) is not None:
+                    migration(self.conn)
+            self.set_meta("schema_version", str(SCHEMA_VERSION))
+            self.conn.execute("COMMIT")
+        except BaseException:
+            self.conn.execute("ROLLBACK")
+            raise
+        log.info("migrated %s from schema v%d to v%d", self.path, version, SCHEMA_VERSION)
 
     def reset(self) -> None:
         """Drop everything and start over (the `new` command)."""
@@ -192,8 +274,9 @@ class UrlStore:
             row = self.conn.execute(
                 "SELECT url, depth, attempts FROM pages "
                 "WHERE status = ? AND attempts < ? "
+                "AND (next_attempt_at IS NULL OR next_attempt_at <= ?) "
                 "ORDER BY depth, discovered_at, url LIMIT 1",
-                (Status.QUEUED, max_attempts),
+                (Status.QUEUED, max_attempts, _stamp(self._now())),
             ).fetchone()
             if row is None:
                 self.conn.execute("COMMIT")
@@ -239,9 +322,47 @@ class UrlStore:
     def requeue(self, url: str, note: str) -> None:
         """Leave the URL queued after a transient failure, recording why."""
         self.conn.execute(
-            "UPDATE pages SET status = ?, note = ? WHERE url = ?",
+            "UPDATE pages SET status = ?, note = ?, next_attempt_at = NULL WHERE url = ?",
             (Status.QUEUED, note, url),
         )
+
+    def defer(self, url: str, note: str, seconds: float) -> None:
+        """Requeue the URL but hold it back for ``seconds``.
+
+        The wait lives in the row rather than in a ``sleep``, for two reasons. A
+        sleep would block the loop on one sick URL while the rest of the frontier
+        waits, and an in-memory delay is erased by exactly the crash it exists to
+        survive -- resuming would hammer the same URL immediately.
+        """
+        if seconds <= 0:
+            self.requeue(url, note)
+            return
+        due = _stamp(self._now() + timedelta(seconds=seconds))
+        self.conn.execute(
+            "UPDATE pages SET status = ?, note = ?, next_attempt_at = ? WHERE url = ?",
+            (Status.QUEUED, note, due, url),
+        )
+
+    def seconds_until_due(self, *, max_attempts: int) -> float | None:
+        """How long until the earliest deferred URL can be claimed.
+
+        ``None`` means there is nothing merely waiting -- so a ``claim`` that
+        returned nothing really is an empty frontier. Distinguishing the two keeps
+        the crawl from reporting "frontier-empty" while work is still pending,
+        which is the same trap `export` and `update` fell into.
+        """
+        row = self.conn.execute(
+            "SELECT MIN(next_attempt_at) AS due FROM pages "
+            "WHERE status = ? AND attempts < ? AND next_attempt_at IS NOT NULL",
+            (Status.QUEUED, max_attempts),
+        ).fetchone()
+        if row is None or row["due"] is None:
+            return None
+        try:
+            due = datetime.strptime(row["due"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=UTC)
+        except ValueError:
+            return 0.0  # unparseable: treat as due rather than waiting for ever
+        return max((due - self._now()).total_seconds(), 0.0)
 
     def release(self, url: str, note: str) -> None:
         """Requeue a URL *and* refund the attempt ``claim`` charged for it.
@@ -253,8 +374,8 @@ class UrlStore:
         ``max_attempts`` on pages that were never the problem.
         """
         self.conn.execute(
-            "UPDATE pages SET status = ?, note = ?, attempts = MAX(attempts - 1, 0) "
-            "WHERE url = ?",
+            "UPDATE pages SET status = ?, note = ?, attempts = MAX(attempts - 1, 0), "
+            "next_attempt_at = NULL WHERE url = ?",
             (Status.QUEUED, note, url),
         )
 

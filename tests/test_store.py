@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Iterator
 from datetime import date
+from pathlib import Path
 
 import pytest
+from conftest import FakeClock
 
-from spa_sitemap.store import Status, StoreError, UrlStore
+from spa_sitemap.store import SCHEMA_VERSION, Status, StoreError, UrlStore
 
 
 @pytest.fixture
@@ -247,3 +250,145 @@ def test_mark_done_reports_whether_it_was_the_first_time(store: UrlStore) -> Non
     store.enqueue(["https://a/1"], depth=0)
     assert store.mark_done("https://a/1", link_count=2) is True
     assert store.mark_done("https://a/1", link_count=9) is False
+
+
+# -- the retry schedule ------------------------------------------------------
+
+
+def test_a_deferred_url_is_withheld_until_it_is_due() -> None:
+    clock = FakeClock()
+    with UrlStore(":memory:", now=clock) as store:
+        store.enqueue(["https://a/1"], depth=0)
+        store.claim(max_attempts=3)
+        store.defer("https://a/1", "HTTP 503", 30.0)
+
+        assert store.claim(max_attempts=3) is None
+        assert store.seconds_until_due(max_attempts=3) == 30.0
+        assert store.has_pending(max_attempts=3)  # deferred work is still pending
+
+        clock.advance(30)
+        page = store.claim(max_attempts=3)
+        assert page is not None
+        assert page.url == "https://a/1"
+
+
+def test_a_deferral_does_not_hide_the_rest_of_the_frontier() -> None:
+    """The point of scheduling rather than sleeping: other work carries on."""
+    clock = FakeClock()
+    with UrlStore(":memory:", now=clock) as store:
+        store.enqueue(["https://a/1", "https://a/2"], depth=0)
+        store.claim(max_attempts=3)
+        store.defer("https://a/1", "HTTP 503", 30.0)
+
+        page = store.claim(max_attempts=3)
+        assert page is not None
+        assert page.url == "https://a/2"
+
+
+def test_no_deferrals_means_an_empty_frontier_really_is_empty(store: UrlStore) -> None:
+    assert store.seconds_until_due(max_attempts=3) is None
+    store.enqueue(["https://a/1"], depth=0)
+    assert store.seconds_until_due(max_attempts=3) is None
+
+
+def test_a_zero_deferral_is_just_a_requeue() -> None:
+    clock = FakeClock()
+    with UrlStore(":memory:", now=clock) as store:
+        store.enqueue(["https://a/1"], depth=0)
+        store.claim(max_attempts=3)
+        store.defer("https://a/1", "HTTP 503", 0.0)
+
+        assert store.seconds_until_due(max_attempts=3) is None
+        assert store.claim(max_attempts=3) is not None
+
+
+def test_requeue_and_release_clear_a_pending_deferral(store: UrlStore) -> None:
+    """A URL held back and then re-decided must not stay stuck in the future."""
+    for url, put_back in (("https://a/1", "requeue"), ("https://a/2", "release")):
+        store.enqueue([url], depth=0)
+        store.claim(max_attempts=3)
+        store.defer(url, "HTTP 503", 300.0)
+        getattr(store, put_back)(url, "changed our mind")
+
+    assert store.seconds_until_due(max_attempts=3) is None
+
+
+# -- schema versions ---------------------------------------------------------
+
+
+def _make_v1_database(path: Path) -> None:
+    """The v1 schema, byte for byte: no next_attempt_at column."""
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE pages (
+            url           TEXT    PRIMARY KEY,
+            status        TEXT    NOT NULL DEFAULT 'queued',
+            depth         INTEGER NOT NULL DEFAULT 0,
+            attempts      INTEGER NOT NULL DEFAULT 0,
+            link_count    INTEGER,
+            note          TEXT,
+            discovered_at TEXT    NOT NULL DEFAULT (datetime('now')),
+            visited_at    TEXT
+        ) WITHOUT ROWID;
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta VALUES ('schema_version', '1');
+        INSERT INTO meta VALUES ('base_url', 'https://old.test/');
+        INSERT INTO pages (url, status) VALUES ('https://old.test/kept', 'done');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def test_an_older_database_is_migrated_in_place(tmp_path: Path) -> None:
+    """Someone's half-finished crawl must survive the upgrade untouched."""
+    path = tmp_path / "old.db"
+    _make_v1_database(path)
+
+    with UrlStore(path) as store:
+        assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
+        assert store.get_meta("base_url") == "https://old.test/"
+        assert list(store.visited_urls()) == ["https://old.test/kept"]
+        # The new column exists and every existing row is due now.
+        store.enqueue(["https://old.test/new"], depth=0)
+        assert store.claim(max_attempts=3) is not None
+
+
+def test_migrating_twice_is_harmless(tmp_path: Path) -> None:
+    """ALTER TABLE cannot add a column twice, so the step must be idempotent."""
+    path = tmp_path / "old.db"
+    _make_v1_database(path)
+    with UrlStore(path):
+        pass
+    with UrlStore(path) as store:
+        assert store.get_meta("schema_version") == str(SCHEMA_VERSION)
+
+
+def test_a_newer_database_is_refused_rather_than_downgraded(tmp_path: Path) -> None:
+    """create_schema used to stamp the version unconditionally.
+
+    An older build opening a newer file left the newer tables in place and rewrote
+    the marker *down*, after which the next upgrade re-ran a migration that had
+    already happened.
+    """
+    path = tmp_path / "future.db"
+    with UrlStore(path) as store:
+        store.set_meta("schema_version", "99")
+
+    with pytest.raises(StoreError, match="newer spa-sitemap"), UrlStore(path):
+        pass
+
+    # ...and the marker was left exactly as it was found.
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0] == "99"
+    conn.close()
+
+
+def test_an_unreadable_schema_version_is_an_error(tmp_path: Path) -> None:
+    path = tmp_path / "bad.db"
+    with UrlStore(path) as store:
+        store.set_meta("schema_version", "banana")
+
+    with pytest.raises(StoreError, match="unreadable schema version"), UrlStore(path):
+        pass

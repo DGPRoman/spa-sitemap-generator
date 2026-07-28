@@ -8,6 +8,7 @@ renderer and an in-memory database, in milliseconds and with no browser.
 from __future__ import annotations
 
 import logging
+import random
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
@@ -60,6 +61,39 @@ class Limits:
             raise ValueError("max_restarts must be zero or more")
 
 
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """How long a failed URL waits before it is offered again.
+
+    Exponential, because a URL that failed twice is unlikely to succeed on the
+    third try one millisecond later, and jittered so a whole wave of URLs that
+    failed together does not come back in lockstep.
+
+    ``base=0`` disables scheduling entirely, which is what the crawl loop's own
+    tests want: without a wait there is nothing to wait for.
+    """
+
+    base: float = 2.0
+    factor: float = 4.0
+    cap: float = 300.0
+    jitter: float = 0.25
+
+    def __post_init__(self) -> None:
+        if self.base < 0 or self.factor < 1 or self.cap < 0 or not 0 <= self.jitter < 1:
+            raise ValueError("retry policy must be base>=0, factor>=1, cap>=0, 0<=jitter<1")
+
+    def delay(self, attempt: int, *, spread: float = 0.5) -> float:
+        """Seconds to hold a URL back after its ``attempt``-th failure.
+
+        ``spread`` is a 0..1 sample supplied by the caller rather than drawn here,
+        so the curve stays a pure function and a test can pin it exactly.
+        """
+        if self.base <= 0:
+            return 0.0
+        raw = min(self.base * self.factor ** max(attempt - 1, 0), self.cap)
+        return raw * (1 + self.jitter * (2 * spread - 1))
+
+
 @dataclass(slots=True)
 class CrawlStats:
     visited: int = 0
@@ -89,7 +123,7 @@ class CrawlStats:
 #: Stop reasons that mean the crawl gave up rather than ran out of work. The CLI
 #: turns these into a non-zero exit, because whatever is still queued is still
 #: queued and a caller must not read exit 0 as "the sitemap is current".
-ABORTED: Final = frozenset({"site-unreachable", "renderer-unavailable"})
+ABORTED: Final = frozenset({"site-unreachable", "renderer-unavailable", "still-backing-off"})
 
 
 class RobotsPolicy(Protocol):
@@ -108,6 +142,16 @@ class Crawler:
 
     PROGRESS_EVERY = 25
 
+    #: Longest single wait when every queued URL is backing off. Bounded so the
+    #: termination guards and Ctrl-C stay responsive rather than being buried
+    #: inside one long sleep.
+    MAX_IDLE_WAIT = 5.0
+
+    #: Consecutive idle waits before giving up on the deferred tail. A backstop
+    #: against a clock that never advances -- a suspended machine, or an injected
+    #: fake -- which would otherwise spin here for ever.
+    MAX_IDLE_WAITS = 120
+
     def __init__(
         self,
         *,
@@ -118,8 +162,10 @@ class Crawler:
         delay: float = 0.0,
         robots: RobotsPolicy | None = None,
         respect_canonical: bool = True,
+        retry: RetryPolicy | None = None,
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        spread: Callable[[], float] = random.random,
     ) -> None:
         self.store = store
         self.renderer = renderer
@@ -128,8 +174,10 @@ class Crawler:
         self.delay = delay
         self.robots = robots
         self.respect_canonical = respect_canonical
+        self.retry = retry or RetryPolicy()
         self._sleep = sleep
         self._monotonic = monotonic
+        self._spread = spread
         self._stop_reason: str | None = None
         self._consecutive_failures = 0
 
@@ -147,6 +195,7 @@ class Crawler:
             stats.discovered += self.store.enqueue(seed_urls, depth=0)
 
         first = True
+        idle_waits = 0
         while True:
             if (reason := self._should_stop(stats, started)) is not None:
                 stats.stop_reason = reason
@@ -154,8 +203,12 @@ class Crawler:
 
             page = self.store.claim(max_attempts=self.limits.max_attempts)
             if page is None:
-                stats.stop_reason = "frontier-empty"
+                if idle_waits < self.MAX_IDLE_WAITS and self._wait_for_due_work():
+                    idle_waits += 1
+                    continue
+                stats.stop_reason = "frontier-empty" if idle_waits == 0 else "still-backing-off"
                 break
+            idle_waits = 0
 
             if self.robots is not None and not self.robots.allows(page.url):
                 self.store.mark_skipped(page.url, "disallowed by robots.txt")
@@ -174,6 +227,24 @@ class Crawler:
 
         stats.elapsed = self._monotonic() - started
         return stats
+
+    def _wait_for_due_work(self) -> bool:
+        """Wait a little for a backing-off URL, reporting whether there was one.
+
+        ``claim`` handing back nothing does not mean the frontier is empty -- it can
+        equally mean every queued URL is serving out a backoff. Calling that
+        "frontier-empty" would recreate the trap `export` and `update` fell into,
+        where one command insists there is work left and the other insists there
+        is none.
+        """
+        due_in = self.store.seconds_until_due(max_attempts=self.limits.max_attempts)
+        if due_in is None:
+            return False
+        wait = min(due_in, self.MAX_IDLE_WAIT)
+        log.info("every queued URL is backing off; waiting %.1fs", wait)
+        if wait > 0:
+            self._sleep(wait)
+        return True
 
     # -- one page ------------------------------------------------------------
 
@@ -274,17 +345,29 @@ class Crawler:
             # and the row goes back untouched. Letting that charge stand is exactly
             # how an outage exhausts real pages and drops them from the sitemap.
             self.store.release(page.url, str(exc))
-            log.warning("not %s's fault, leaving it queued: %s", page.url, exc)
             if isinstance(exc, RendererUnavailableError):
+                # No backoff: a replacement browser is ready immediately, and this
+                # URL has not been given a real chance yet.
+                log.warning("not %s's fault, leaving it queued: %s", page.url, exc)
                 self._recover_renderer(stats)
+            else:
+                # Paced, not escalating. Deciding when to give up on a site is the
+                # breaker's job, so this only has to avoid hammering -- and an
+                # exponential curve here would fight it: measured against a real
+                # dead server, backing off by the failure streak hit the 300s cap
+                # within a handful of failures and left the run stalling for
+                # minutes before abandoning a site it already knew was unreachable.
+                self._defer(page.url, exc, attempt=1)
         elif tripped or (exc.retryable and page.attempts < self.limits.max_attempts):
             # On the way out, keep the URL queued rather than failing it: the whole
             # point of stopping is that `update` finds a frontier to resume.
-            self.store.requeue(page.url, str(exc))
-            if not tripped:
+            if tripped:
+                self.store.requeue(page.url, str(exc))
+            else:
                 log.warning(
                     "retry %d/%d: %s (%s)", page.attempts, self.limits.max_attempts, page.url, exc
                 )
+                self._defer(page.url, exc, attempt=page.attempts)
         else:
             self.store.mark_failed(page.url, str(exc))
             stats.failed += 1
@@ -297,6 +380,13 @@ class Crawler:
                 self._consecutive_failures, page.url, exc,
             )
             self.request_stop("site-unreachable")
+
+    def _defer(self, url: str, exc: RenderError, *, attempt: int) -> None:
+        """Hold a URL back, so the loop moves on instead of retrying it at once."""
+        wait = self.retry.delay(attempt, spread=self._spread())
+        self.store.defer(url, str(exc), wait)
+        if wait > 0:
+            log.debug("holding %s back for %.1fs", url, wait)
 
     def _recover_renderer(self, stats: CrawlStats) -> None:
         """Replace a dead browser, or end the run if that is not possible.

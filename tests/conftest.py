@@ -4,11 +4,31 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+
+
+class FakeClock:
+    """A wall clock that a fake sleep drives forward.
+
+    Retries are scheduled against wall time in the database, so a sleep that does
+    nothing would leave every deferred URL permanently in the future. Wiring the
+    two together lets the real, shipped RetryPolicy be exercised by the ordinary
+    tests -- in microseconds, and without opting them out of what users get.
+    """
+
+    def __init__(self) -> None:
+        self.now = datetime(2026, 1, 1, tzinfo=UTC)
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += timedelta(seconds=seconds)
 
 FIXTURE_SITE = Path(__file__).parent / "fixtures" / "site"
 
