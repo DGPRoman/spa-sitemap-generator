@@ -243,6 +243,21 @@ class UrlStore:
             (Status.QUEUED, note, url),
         )
 
+    def release(self, url: str, note: str) -> None:
+        """Requeue a URL *and* refund the attempt ``claim`` charged for it.
+
+        ``claim`` counts the attempt up front, which is what stops a page that
+        crashes the browser from being retried forever. When the browser died or
+        the site was unreachable, though, that charge is a lie: the URL never got
+        a fair navigation, and letting it stand is how an outage burns through
+        ``max_attempts`` on pages that were never the problem.
+        """
+        self.conn.execute(
+            "UPDATE pages SET status = ?, note = ?, attempts = MAX(attempts - 1, 0) "
+            "WHERE url = ?",
+            (Status.QUEUED, note, url),
+        )
+
     def _finish(self, url: str, status: Status, note: str) -> None:
         self.conn.execute(
             "UPDATE pages SET status = ?, note = ?, visited_at = datetime('now') "

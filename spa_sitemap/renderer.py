@@ -170,6 +170,20 @@ class Renderer(Protocol):
         ...
 
 
+@runtime_checkable
+class Restartable(Protocol):
+    """A renderer that can replace its browser after one dies.
+
+    Separate from ``Renderer`` so the crawl loop's fakes stay two-line classes: a
+    fake has nothing to restart, and the crawler checks for the capability rather
+    than requiring it.
+    """
+
+    def restart(self) -> None:
+        """Discard the current browser and start a fresh one."""
+        ...
+
+
 @dataclass(slots=True)
 class ChromeRenderer:
     """Headless Chrome driving a real page load, then reading the rendered DOM.
@@ -247,6 +261,15 @@ class ChromeRenderer:
         finally:
             self._driver = None
 
+    def restart(self) -> None:
+        """Replace the browser, for when the current one has died mid-crawl.
+
+        ``stop()`` swallows its own failures, which is what makes this safe to call
+        on a chromedriver that has already exited.
+        """
+        self.stop()
+        self.start()
+
     @property
     def driver(self) -> WebDriver:
         if self._driver is None:
@@ -257,6 +280,7 @@ class ChromeRenderer:
 
     def render(self, url: str) -> RenderedPage:
         from selenium.common.exceptions import TimeoutException, WebDriverException
+        from urllib3.exceptions import HTTPError as DriverGone
 
         driver = self.driver
         self._drain_performance_log()
@@ -267,6 +291,8 @@ class ChromeRenderer:
         except TimeoutException as exc:
             self._abort_pending_load()
             raise RenderError(f"page load timed out after {self.page_load_timeout}s") from exc
+        except DriverGone as exc:
+            raise _driver_gone(exc) from exc
         except WebDriverException as exc:
             raise _as_render_error("navigation failed", exc) from exc
 
@@ -282,6 +308,8 @@ class ChromeRenderer:
             final_url = driver.current_url or url
         except TimeoutException as exc:
             raise RenderError(f"page never settled: {_brief(exc)}") from exc
+        except DriverGone as exc:
+            raise _driver_gone(exc) from exc
         except WebDriverException as exc:
             raise _as_render_error("could not read the DOM", exc) from exc
 
@@ -338,9 +366,12 @@ class ChromeRenderer:
 
     def _current_url(self) -> str:
         from selenium.common.exceptions import WebDriverException
+        from urllib3.exceptions import HTTPError as DriverGone
 
         try:
             return str(self.driver.current_url)
+        except DriverGone as exc:
+            raise _driver_gone(exc) from exc
         except WebDriverException:
             return ""
 
@@ -426,14 +457,39 @@ class ChromeRenderer:
                 continue
 
     def _performance_entries(self) -> list[dict[str, Any]]:
+        from urllib3.exceptions import HTTPError as DriverGone
+
         try:
             # get_log carries no annotations in selenium itself.
             entries = self.driver.get_log("performance")  # type: ignore[no-untyped-call]
             return cast("list[dict[str, Any]]", entries)
+        except DriverGone as exc:
+            # A dead driver is not "this browser has no performance log". Taking the
+            # broad path below would turn status detection off permanently, so a
+            # single crash would silently cost 404 detection for the rest of the
+            # crawl -- including after the browser has been replaced.
+            raise _driver_gone(exc) from exc
         except Exception:
             log.debug("performance log unavailable; HTTP status detection is off")
             self.detect_http_errors = False
             return []
+
+
+def _driver_gone(exc: BaseException) -> RendererUnavailableError:
+    """The chromedriver process itself stopped answering.
+
+    Selenium talks to chromedriver over HTTP via urllib3, so when that process
+    dies the failure arrives as a urllib3 connection error and is *not* a
+    ``WebDriverException`` -- it is not even an ``OSError``. Found by killing
+    chromedriver mid-crawl: it sailed past every handler here and reached ``main``
+    as "unexpected failure: HTTPConnectionPool ... Connection refused", aborting
+    the run without ever reaching the recovery path meant for exactly this.
+
+    Recognised by exception type rather than message text, because the message is
+    a urllib3 implementation detail and this is the single most likely way for a
+    browser to die mid-crawl.
+    """
+    return RendererUnavailableError(f"chromedriver stopped answering: {_brief(exc)}")
 
 
 def _as_render_error(context: str, exc: BaseException) -> RenderError:

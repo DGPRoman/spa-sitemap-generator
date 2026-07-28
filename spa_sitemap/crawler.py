@@ -11,9 +11,16 @@ import logging
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Final, Protocol
 
-from spa_sitemap.renderer import NotHtmlError, Renderer, RenderError
+from spa_sitemap.renderer import (
+    NotHtmlError,
+    Renderer,
+    RenderError,
+    RendererUnavailableError,
+    Restartable,
+    SiteUnavailableError,
+)
 from spa_sitemap.store import Page, UrlStore
 from spa_sitemap.urls import UrlPolicy
 
@@ -37,11 +44,20 @@ class Limits:
     #: permanent failures at full speed. ``None`` disables the breaker.
     max_consecutive_failures: int | None = 10
 
+    #: Browsers to burn through before giving up. A dead browser is bounded here
+    #: rather than by the failure streak above, because a crash tells us nothing
+    #: about the site -- but a page that reliably kills Chrome would otherwise
+    #: restart it forever, and a Chrome that will not start is a machine problem
+    #: that no amount of retrying fixes.
+    max_restarts: int = 3
+
     def __post_init__(self) -> None:
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         if self.max_consecutive_failures is not None and self.max_consecutive_failures < 1:
             raise ValueError("max_consecutive_failures must be at least 1, or None to disable")
+        if self.max_restarts < 0:
+            raise ValueError("max_restarts must be zero or more")
 
 
 @dataclass(slots=True)
@@ -52,17 +68,28 @@ class CrawlStats:
     redirected: int = 0
     duplicates: int = 0
     discovered: int = 0
+    restarts: int = 0
     elapsed: float = 0.0
     stop_reason: str = "frontier-empty"
 
     def summary(self) -> str:
+        # Restarts are reported because an automatic recovery is a quiet
+        # degradation: a crawl that replaced Chrome forty times succeeded, and
+        # without saying so it becomes a debugging black hole.
+        restarts = f", {self.restarts} browser restarts" if self.restarts else ""
         return (
             f"{self.visited} visited, {self.discovered} discovered, "
             f"{self.failed} failed, {self.skipped} skipped, "
-            f"{self.redirected} redirected, {self.duplicates} duplicate in "
-            f"{self.elapsed:.1f}s "
+            f"{self.redirected} redirected, {self.duplicates} duplicate"
+            f"{restarts} in {self.elapsed:.1f}s "
             f"({self.stop_reason})"
         )
+
+
+#: Stop reasons that mean the crawl gave up rather than ran out of work. The CLI
+#: turns these into a non-zero exit, because whatever is still queued is still
+#: queued and a caller must not read exit 0 as "the sitemap is current".
+ABORTED: Final = frozenset({"site-unreachable", "renderer-unavailable"})
 
 
 class RobotsPolicy(Protocol):
@@ -225,6 +252,7 @@ class Crawler:
         return target
 
     def _handle_failure(self, page: Page, exc: RenderError, stats: CrawlStats) -> None:
+        """Charge the failure to whoever is actually responsible for it."""
         if isinstance(exc, NotHtmlError):
             # A definite answer about this URL -- not evidence that anything is
             # broken, so it must not count towards the circuit breaker.
@@ -233,29 +261,71 @@ class Crawler:
             log.info("skip: %s (%s)", page.url, exc)
             return
 
-        self._consecutive_failures += 1
-        if self._breaker_tripped():
-            # Leave this URL queued rather than failing it: the point of stopping
-            # is that the frontier survives the outage intact, so `update` has
-            # something to resume once the site (or the browser) comes back.
+        # A dead browser is bounded by max_restarts instead: counting a crash here
+        # as well would let one Chrome death trip two independent guards, and the
+        # failure streak is meant to measure the *site* going quiet.
+        if not isinstance(exc, RendererUnavailableError):
+            self._consecutive_failures += 1
+        tripped = self._breaker_tripped()
+
+        if isinstance(exc, (SiteUnavailableError, RendererUnavailableError)):
+            # Neither the site vanishing nor the browser dying says anything about
+            # this URL, so the attempt `claim` charged for it up front is refunded
+            # and the row goes back untouched. Letting that charge stand is exactly
+            # how an outage exhausts real pages and drops them from the sitemap.
+            self.store.release(page.url, str(exc))
+            log.warning("not %s's fault, leaving it queued: %s", page.url, exc)
+            if isinstance(exc, RendererUnavailableError):
+                self._recover_renderer(stats)
+        elif tripped or (exc.retryable and page.attempts < self.limits.max_attempts):
+            # On the way out, keep the URL queued rather than failing it: the whole
+            # point of stopping is that `update` finds a frontier to resume.
             self.store.requeue(page.url, str(exc))
+            if not tripped:
+                log.warning(
+                    "retry %d/%d: %s (%s)", page.attempts, self.limits.max_attempts, page.url, exc
+                )
+        else:
+            self.store.mark_failed(page.url, str(exc))
+            stats.failed += 1
+            log.warning("failed: %s (%s)", page.url, exc)
+
+        if tripped:
             log.error(
                 "%d failures in a row, the last on %s (%s) -- abandoning this run "
                 "with the frontier intact; run `update` to continue",
                 self._consecutive_failures, page.url, exc,
             )
             self.request_stop("site-unreachable")
+
+    def _recover_renderer(self, stats: CrawlStats) -> None:
+        """Replace a dead browser, or end the run if that is not possible.
+
+        Without this, one dead chromedriver failed every remaining URL: each got
+        ``max_attempts`` futile navigations and then ``failed``, and since only
+        ``queued`` rows are ever claimed, `update` could not get them back.
+        """
+        if not isinstance(self.renderer, Restartable):
+            log.error("this renderer cannot be restarted; ending the run")
+            self.request_stop("renderer-unavailable")
             return
 
-        if exc.retryable and page.attempts < self.limits.max_attempts:
-            self.store.requeue(page.url, str(exc))
-            log.warning(
-                "retry %d/%d: %s (%s)", page.attempts, self.limits.max_attempts, page.url, exc
+        if stats.restarts >= self.limits.max_restarts:
+            log.error(
+                "the browser has died %d times already; ending the run", stats.restarts
             )
-        else:
-            self.store.mark_failed(page.url, str(exc))
-            stats.failed += 1
-            log.warning("failed: %s (%s)", page.url, exc)
+            self.request_stop("renderer-unavailable")
+            return
+
+        try:
+            self.renderer.restart()
+        except Exception as exc:
+            log.error("could not restart the browser: %s; ending the run", exc)
+            self.request_stop("renderer-unavailable")
+            return
+
+        stats.restarts += 1
+        log.warning("browser restarted (%d/%d)", stats.restarts, self.limits.max_restarts)
 
     def _breaker_tripped(self) -> bool:
         limit = self.limits.max_consecutive_failures

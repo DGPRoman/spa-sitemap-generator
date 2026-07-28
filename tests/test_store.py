@@ -178,6 +178,46 @@ def test_queued_pages_have_no_visit_date(store: UrlStore) -> None:
     assert list(store.visited_entries()) == []
 
 
+def test_release_refunds_the_attempt_the_claim_charged(store: UrlStore) -> None:
+    """`max_attempts=1` leaves no slack: without the refund the row is gone.
+
+    `claim` counts the attempt up front so a page that kills the browser cannot be
+    retried for ever. When the browser or the site was at fault, that charge is a
+    lie, and leaving it in place is how an outage exhausts pages that were fine.
+    """
+    store.enqueue(["https://a/1"], depth=0)
+    claimed = store.claim(max_attempts=1)
+    assert claimed is not None
+    assert claimed.attempts == 1
+    assert store.claim(max_attempts=1) is None  # charged, so nothing left to hand out
+
+    store.release("https://a/1", "net::ERR_CONNECTION_REFUSED")
+
+    again = store.claim(max_attempts=1)
+    assert again is not None
+    assert again.url == "https://a/1"
+
+
+def test_release_keeps_the_reason_and_the_queued_status(store: UrlStore) -> None:
+    store.enqueue(["https://a/1"], depth=0)
+    store.claim(max_attempts=3)
+    store.release("https://a/1", "net::ERR_NAME_NOT_RESOLVED")
+
+    assert store.counts()[Status.QUEUED] == 1
+    assert store.has_pending(max_attempts=3)
+
+
+def test_release_never_drives_attempts_below_zero(store: UrlStore) -> None:
+    """Releasing without a matching claim must not make a URL immortal."""
+    store.enqueue(["https://a/1"], depth=0)
+    store.release("https://a/1", "browser died")
+    store.release("https://a/1", "browser died again")
+
+    page = store.claim(max_attempts=1)
+    assert page is not None
+    assert page.attempts == 1
+
+
 # -- metadata & reset --------------------------------------------------------
 
 

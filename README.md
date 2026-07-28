@@ -100,30 +100,43 @@ A "site" here is the whole scope, not just the host: `example.com/docs/` and
 ## When things go wrong mid-crawl
 
 A crawl that runs for hours will meet a dropped connection, a rate limit, or a
-browser that dies. Two guards bound the damage:
+browser that dies. What happens next depends on who is at fault, which the
+renderer works out from what the browser said:
+
+| Fault | Examples | The URL pays | The run pays |
+|-------|----------|--------------|--------------|
+| The URL | `404`, `410`, a page that never settles | one attempt; `failed` once they run out | nothing |
+| The site | DNS failure, refused or reset connection, expired certificate | nothing — its attempt is refunded | counts towards `max_consecutive_failures` |
+| The browser | crashed tab, dead chromedriver, invalid session | nothing — its attempt is refunded | costs one of `max_restarts` |
+
+Only `408`, `425`, `429` and `5xx` are worth another navigation; other `4xx` are
+not. Treating `429` as permanent used to drop real pages from the sitemap of any
+site that rate-limits mid-crawl.
+
+Three limits bound the damage:
 
 - **Per URL**, `max_attempts` (default 3) retries a transient failure before the
   URL is recorded as `failed`.
-Which of those applies depends on who is at fault, which the renderer works out
-from what the browser said:
-
-| Fault | Examples | Treated as |
-|-------|----------|------------|
-| The URL | `404`, `410`, a page that never settles | retried only if the status says it is worth it |
-| The site | DNS failure, refused/reset connection, expired certificate | not the URL's problem — see below |
-| The browser | crashed tab, dead chromedriver, invalid session | not the URL's problem — see below |
-
-`408`, `425`, `429` and every `5xx` are retried; other `4xx` are not. Treating
-`429` as permanent used to drop real pages from the sitemap of any site that
-rate-limits mid-crawl.
-
 - **Per run**, `max_consecutive_failures` (default 10) abandons the whole crawl
-  once that many renders fail in a row with no success in between. A dead
-  chromedriver or an unreachable site fails *every* page it is handed, so without
-  this the crawl would walk the entire frontier converting it into permanent
-  failures — and since only `queued` URLs are ever retried, `update` could not
-  recover them. Stopping early leaves the frontier intact, so `update` resumes
-  once the site is back.
+  once that many renders fail in a row with no success in between. An unreachable
+  site fails *every* page it is handed, so without this the crawl would walk the
+  entire frontier converting it into permanent failures — and since only `queued`
+  URLs are ever claimed, `update` could not recover them. Stopping early leaves
+  the frontier intact, so `update` resumes once the site is back.
+- **Per browser**, `max_restarts` (default 3) bounds how many replacement Chromes
+  one run will start. A dead browser is bounded here rather than by the failure
+  streak, because a crash says nothing about the site.
+
+The refund matters more than it sounds. `claim` counts an attempt *before*
+rendering, which is what stops a page that crashes Chrome from being retried for
+ever — but when the browser or the site was at fault the URL never got a fair
+navigation, so charging it is how an outage exhausts pages that were perfectly
+fine. A crawl cut short by a dead chromedriver or a site outage now costs the
+frontier nothing: everything not yet rendered is still `queued`.
+
+Browser restarts are counted in the crawl summary, because an automatic recovery
+is a quiet degradation — a run that replaced Chrome forty times should not read as
+identical to one that never did.
 
 ## Configuration
 
@@ -162,6 +175,7 @@ Command-line flags override file values.
 | `max_pages`, `max_depth`, `max_runtime` | `null` | Termination guards. |
 | `max_attempts` | `3` | Tries per URL before giving up on it. |
 | `max_consecutive_failures` | `10` | Abandon the run after this many failures in a row; `null` disables. |
+| `max_restarts` | `3` | Replacement browsers to try before giving up on the run. |
 | `database_path` | `db/sitemap.db` | Crawl state. |
 | `output_path` | `sitemap.xml` | Sitemap destination. |
 

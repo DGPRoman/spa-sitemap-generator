@@ -24,7 +24,7 @@ from typing import cast
 
 from spa_sitemap import __version__
 from spa_sitemap.config import DEFAULT_CONFIG_PATH, Config, ConfigError
-from spa_sitemap.crawler import Crawler, Limits
+from spa_sitemap.crawler import ABORTED, Crawler, Limits
 from spa_sitemap.renderer import ChromeRenderer
 from spa_sitemap.robots import Robots, allow_all
 from spa_sitemap.robots import load as load_robots
@@ -339,6 +339,7 @@ def _run_crawl(config: Config, store: UrlStore, *, seeds: Sequence[str]) -> int:
         max_runtime=config.max_runtime,
         max_attempts=config.max_attempts,
         max_consecutive_failures=config.max_consecutive_failures,
+        max_restarts=config.max_restarts,
     )
 
     renderer = ChromeRenderer(
@@ -370,10 +371,11 @@ def _run_crawl(config: Config, store: UrlStore, *, seeds: Sequence[str]) -> int:
 
     if stats.stop_reason == "interrupted":
         return EXIT_INTERRUPTED
-    if stats.stop_reason == "site-unreachable":
+    if stats.stop_reason in ABORTED:
         # Whatever was queued is still queued, and a caller that treats exit 0 as
         # "the sitemap is current" would be wrong.
-        log.error("run `update` to carry on once the site is reachable again")
+        log.error("the crawl was abandoned (%s); run `update` to carry on",
+                  stats.stop_reason)
         return EXIT_ERROR
     if stats.visited == 0 and stats.failed:
         # The breaker only fires on a long enough streak, so a small frontier can

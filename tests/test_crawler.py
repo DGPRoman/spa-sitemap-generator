@@ -11,8 +11,14 @@ from collections.abc import Iterator
 
 import pytest
 
-from spa_sitemap.crawler import Crawler, Limits
-from spa_sitemap.renderer import NotHtmlError, RenderedPage, RenderError
+from spa_sitemap.crawler import Crawler, CrawlStats, Limits
+from spa_sitemap.renderer import (
+    NotHtmlError,
+    RenderedPage,
+    RenderError,
+    RendererUnavailableError,
+    SiteUnavailableError,
+)
 from spa_sitemap.store import Status, UrlStore
 from spa_sitemap.urls import UrlPolicy
 
@@ -58,7 +64,7 @@ class FlakyRenderer:
 
 
 class DeadRenderer:
-    """Every call fails, the way it does once chromedriver has died."""
+    """Every call fails, and the failure looks like the URL's fault."""
 
     def __init__(self) -> None:
         self.calls = 0
@@ -66,6 +72,36 @@ class DeadRenderer:
     def render(self, url: str) -> RenderedPage:
         self.calls += 1
         raise RenderError("chrome not reachable")
+
+
+class CrashingRenderer:
+    """Loses its browser for the first ``deaths`` calls, then works. Restartable."""
+
+    def __init__(self, deaths: int, graph: dict[str, list[str]] | None = None) -> None:
+        self.deaths = deaths
+        self.graph = graph or {}
+        self.calls = 0
+        self.restarts = 0
+
+    def render(self, url: str) -> RenderedPage:
+        self.calls += 1
+        if self.calls <= self.deaths:
+            raise RendererUnavailableError("invalid session id")
+        return RenderedPage(url=url, links=tuple(self.graph.get(url, [])))
+
+    def restart(self) -> None:
+        self.restarts += 1
+
+
+class UnreachableRenderer:
+    """The site is down, so every URL fails for a reason that is not its own."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def render(self, url: str) -> RenderedPage:
+        self.calls += 1
+        raise SiteUnavailableError("navigation failed: net::ERR_CONNECTION_REFUSED")
 
 
 @pytest.fixture
@@ -264,6 +300,118 @@ def test_a_run_of_downloads_does_not_trip_the_breaker(store: UrlStore) -> None:
     assert stats.stop_reason == "frontier-empty"
     assert stats.skipped == 5
     assert stats.failed == 0
+
+
+def test_a_site_outage_costs_the_frontier_nothing(store: UrlStore) -> None:
+    """The residue the breaker alone left behind.
+
+    With the failure charged to the URL, each page burnt max_attempts back to back
+    before the streak reached the threshold, so a handful of perfectly good pages
+    were recorded as permanently failed -- and only `queued` rows are ever claimed,
+    so `update` could not get them back. Charging it to the site instead costs the
+    frontier nothing at all.
+    """
+    store.enqueue([f"https://example.com/p{n}" for n in range(20)], depth=0)
+    renderer = UnreachableRenderer()
+
+    stats = make_crawler(
+        store, renderer, limits=Limits(max_attempts=3, max_consecutive_failures=5)
+    ).crawl()
+
+    assert stats.stop_reason == "site-unreachable"
+    assert renderer.calls == 5
+    assert stats.failed == 0
+    assert store.counts()[Status.FAILED] == 0
+    assert store.counts()[Status.QUEUED] == 20
+
+
+# -- a browser that dies mid-crawl -------------------------------------------
+
+
+def test_a_dead_browser_is_replaced_and_the_crawl_carries_on(store: UrlStore) -> None:
+    renderer = CrashingRenderer(deaths=1, graph={BASE: []})
+    stats = make_crawler(store, renderer).crawl([BASE])
+
+    assert renderer.restarts == 1
+    assert stats.restarts == 1
+    assert stats.visited == 1
+    assert stats.failed == 0
+    assert stats.stop_reason == "frontier-empty"
+
+
+def test_a_browser_death_does_not_cost_the_url_an_attempt(store: UrlStore) -> None:
+    """`max_attempts=1` leaves no slack, so a burnt attempt would lose the page."""
+    renderer = CrashingRenderer(deaths=1, graph={BASE: []})
+    stats = make_crawler(store, renderer, limits=Limits(max_attempts=1)).crawl([BASE])
+
+    assert stats.visited == 1
+    assert stats.failed == 0
+
+
+def test_a_browser_crash_does_not_count_towards_the_site_breaker(store: UrlStore) -> None:
+    """Two guards, two meanings.
+
+    The streak measures the *site* going quiet; a crash says nothing about the
+    site and is bounded by max_restarts. Counting it in both would let one dead
+    Chrome trip a guard that is not about it.
+    """
+    renderer = CrashingRenderer(deaths=4, graph={BASE: []})
+    stats = make_crawler(
+        store, renderer, limits=Limits(max_consecutive_failures=2, max_restarts=5)
+    ).crawl([BASE])
+
+    assert stats.restarts == 4
+    assert stats.visited == 1
+    assert stats.stop_reason == "frontier-empty"
+
+
+def test_a_browser_that_keeps_dying_ends_the_run_intact(store: UrlStore) -> None:
+    store.enqueue([f"https://example.com/p{n}" for n in range(20)], depth=0)
+    renderer = CrashingRenderer(deaths=999)
+
+    stats = make_crawler(store, renderer, limits=Limits(max_restarts=2)).crawl()
+
+    assert stats.stop_reason == "renderer-unavailable"
+    assert renderer.restarts == 2
+    assert store.counts()[Status.FAILED] == 0
+    assert store.counts()[Status.QUEUED] == 20
+
+
+def test_a_renderer_that_cannot_be_restarted_ends_the_run(store: UrlStore) -> None:
+    """FakeRenderer and friends have no restart(); the crawler must not require one."""
+    renderer = FakeRenderer(
+        {BASE: []},
+        failures={BASE: RendererUnavailableError("chrome not reachable")},
+    )
+    stats = make_crawler(store, renderer).crawl([BASE])
+
+    assert stats.stop_reason == "renderer-unavailable"
+    assert stats.restarts == 0
+    assert store.counts()[Status.QUEUED] == 1
+    assert store.counts()[Status.FAILED] == 0
+
+
+def test_a_restart_that_itself_fails_ends_the_run(store: UrlStore) -> None:
+    """A Chrome that will not start is a machine problem; retrying cannot fix it."""
+
+    class WontRestart(CrashingRenderer):
+        def restart(self) -> None:
+            raise OSError("chrome failed to start: exited abnormally")
+
+    stats = make_crawler(store, WontRestart(deaths=999)).crawl([BASE])
+
+    assert stats.stop_reason == "renderer-unavailable"
+    assert stats.restarts == 0
+    assert store.counts()[Status.QUEUED] == 1
+
+
+def test_restarts_are_reported_in_the_summary(store: UrlStore) -> None:
+    """An automatic recovery is a quiet degradation unless the summary says so."""
+    renderer = CrashingRenderer(deaths=2, graph={BASE: []})
+    stats = make_crawler(store, renderer).crawl([BASE])
+
+    assert "2 browser restarts" in stats.summary()
+    assert "browser restarts" not in CrawlStats().summary()
 
 
 def test_the_breaker_can_be_turned_off(store: UrlStore) -> None:

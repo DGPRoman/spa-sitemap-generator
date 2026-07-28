@@ -72,6 +72,7 @@ class Config:
     max_runtime: float | None = None
     max_attempts: int = 3
     max_consecutive_failures: int | None = 10
+    max_restarts: int = 3
 
     # paths
     database_path: Path = Path("db/sitemap.db")
@@ -211,6 +212,12 @@ class Config:
 
         if not isinstance(self.max_attempts, int) or self.max_attempts < 1:
             raise ConfigError(f"max_attempts must be an integer >= 1, got {self.max_attempts!r}")
+
+        if not isinstance(self.max_restarts, int) or isinstance(self.max_restarts, bool) \
+                or self.max_restarts < 0:
+            raise ConfigError(
+                f"max_restarts must be an integer >= 0, got {self.max_restarts!r}"
+            )
 
         breaker = self.max_consecutive_failures
         if breaker is not None and (
