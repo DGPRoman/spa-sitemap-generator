@@ -26,7 +26,7 @@ from spa_sitemap.urls import CRAWLABLE_SCHEMES, TRACKING_PARAMS, UrlPolicy
 DEFAULT_CONFIG_PATH = Path("config.json")
 
 #: Accepted for backwards compatibility with the original config.json.
-_ALIASES = {"url": "base_url", "output": "output_path", "database": "database_path"}
+_ALIASES = {"url": "base_url"}
 
 
 class ConfigError(ValueError):
@@ -74,12 +74,9 @@ class Config:
     max_consecutive_failures: int | None = 10
     max_restarts: int = 3
 
-    # paths. Unset by default: they are derived from the site being crawled, so
-    # `new --url a.test` and `new --url b.test` cannot land in the same file. A
-    # value here (from --database/-o or the config file) always wins, which is the
-    # escape hatch for anyone who wants to choose the layout themselves.
-    database_path: Path | None = None
-    output_path: Path | None = None
+    #: Where the per-site directories live. The database and sitemap paths
+    #: themselves are not configurable: deriving them from the URL is what makes
+    #: "one database, one site" true by construction instead of by a check.
     sites_dir: Path = Path("sites")
 
     def __post_init__(self) -> None:
@@ -158,7 +155,7 @@ class Config:
         for key in ("strip_query_params", "exclude_patterns"):
             if key in kwargs and kwargs[key] is not None:
                 kwargs[key] = tuple(str(item) for item in kwargs[key])
-        for key in ("database_path", "output_path", "sites_dir"):
+        for key in ("sites_dir",):
             if key in kwargs and kwargs[key] is not None:
                 kwargs[key] = Path(str(kwargs[key]))
         if kwargs.get("window_size") is not None:

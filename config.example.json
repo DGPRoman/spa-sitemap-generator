@@ -16,8 +16,6 @@
   "max_attempts": 3,
   "max_consecutive_failures": 10,
   "max_restarts": 3,
-  "database_path": null,
-  "output_path": null,
   "respect_canonical": true,
   "hash_routing": false
 }

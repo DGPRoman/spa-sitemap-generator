@@ -29,10 +29,7 @@ def test_loads_a_minimal_config(tmp_path: Path) -> None:
     config = Config.load(write_config(tmp_path, MINIMAL))
     assert config.base_url == "https://example.com/"
     assert config.delay == 1.0
-    # Unset on purpose: the paths are derived from the site being crawled, so two
-    # sites cannot land in one file just because nobody passed --database.
-    assert config.database_path is None
-    assert config.output_path is None
+    assert config.sites_dir == Path("sites")
 
 
 def test_a_missing_file_names_the_file_and_the_fix(tmp_path: Path) -> None:
@@ -150,16 +147,14 @@ def test_json_lists_and_strings_become_tuples_and_paths(tmp_path: Path) -> None:
                 **MINIMAL,
                 "exclude_patterns": ["/logout"],
                 "strip_query_params": ["sid"],
-                "database_path": "out/db.sqlite",
-                "output_path": "out/sitemap.xml",
+                "sites_dir": "crawls",
                 "window_size": [800, 600],
             },
         )
     )
     assert config.exclude_patterns == ("/logout",)
     assert config.strip_query_params == ("sid",)
-    assert config.database_path == Path("out/db.sqlite")
-    assert config.output_path == Path("out/sitemap.xml")
+    assert config.sites_dir == Path("crawls")
     assert config.window_size == (800, 600)
 
 

@@ -2,8 +2,8 @@
 
 One database holds one site -- its rows are keyed by URLs canonicalised under one
 scope, so mixing two sites in one file would mean every read needing a filter it
-could forget. Rather than making the user remember a ``--database`` per site, the
-path is derived from the URL:
+could forget. The path is therefore derived from the URL rather than chosen, which
+makes the rule true by construction instead of by a check:
 
     sites/example.com/sitemap.db
     sites/example.com/sitemap.xml
@@ -25,10 +25,6 @@ from typing import Final
 from spa_sitemap.urls import Scope, ScopeError
 
 DEFAULT_SITES_DIR: Final = Path("sites")
-
-#: Where crawls lived before they were kept per site. Still honoured when it is
-#: there, so upgrading does not orphan a crawl somebody is part-way through.
-LEGACY_DATABASE: Final = Path("db/sitemap.db")
 
 DATABASE_NAME: Final = "sitemap.db"
 OUTPUT_NAME: Final = "sitemap.xml"

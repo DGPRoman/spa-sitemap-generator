@@ -20,7 +20,7 @@ from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 from types import FrameType
-from typing import Final, cast
+from typing import cast
 
 from spa_sitemap import __version__, sites
 from spa_sitemap.config import DEFAULT_CONFIG_PATH, Config, ConfigError
@@ -63,10 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
              "(default: derived from --url, or the only site there is)",
     )
     common.add_argument(
-        "--database", type=Path, dest="database_path",
-        help="SQLite file to use, instead of the one derived from the site",
-    )
-    common.add_argument(
         "--url", dest="base_url",
         help="the site to crawl; overrides base_url from the config file",
     )
@@ -99,9 +95,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     export_opts = argparse.ArgumentParser(add_help=False)
-    export_opts.add_argument(
-        "-o", "--output", type=Path, dest="output_path", help="sitemap file to write"
-    )
     export_opts.add_argument(
         "--lastmod", metavar="WHEN",
         help="add <lastmod>: 'visited' (when each page was crawled), 'today', "
@@ -150,7 +143,7 @@ def _config_from_args(args: argparse.Namespace) -> Config:
         for name in (
             "base_url", "delay", "headless", "respect_robots", "respect_canonical",
             "wait_for_selector",
-            "max_pages", "max_depth", "max_runtime", "database_path", "output_path",
+            "max_pages", "max_depth", "max_runtime",
         )
     }
     # A named -c must exist; the default config.json is used only if it is there,
@@ -182,21 +175,16 @@ def _parse_lastmod(value: str | None) -> date | str | None:
 
 
 def _paths(config: Config, site: str | None) -> tuple[Path, Path]:
-    """The database and sitemap this invocation should use.
+    """The database and sitemap for this invocation.
 
-    Derived rather than configured, so crawling a second site needs no flags and
-    cannot collide with the first. Explicit paths always win; otherwise, in order:
-    ``--site NAME``, the URL's own scope, the pre-``sites/`` layout, or the single
-    site already on disk.
+    Derived, never configured. There is deliberately no way to point a command at
+    an arbitrary file: the one-site-per-database rule is then true by construction
+    rather than by a check somebody has to remember.
+
+    ``--site NAME`` if given, else the URL's own scope, else the single site on
+    disk -- and otherwise an error listing the candidates, because guessing between
+    them is a coin toss with somebody's sitemap.
     """
-    if config.database_path is not None and config.output_path is not None:
-        return config.database_path, config.output_path  # nothing left to work out
-
-    database, output = _derive(config, site)
-    return config.database_path or database, config.output_path or output
-
-
-def _derive(config: Config, site: str | None) -> tuple[Path, Path]:
     if site is not None:
         chosen = sites.named(site, sites_dir=config.sites_dir)
     elif config.base_url:
@@ -206,42 +194,22 @@ def _derive(config: Config, site: str | None) -> tuple[Path, Path]:
             include_subdomains=config.include_subdomains,
             restrict_to_path=config.restrict_to_path,
         )
-        # An upgrade must not orphan a crawl somebody is part-way through -- but
-        # only if that old file is *this* site. If it belongs to another one,
-        # deriving a fresh path is better than handing the user a conflict.
-        if not chosen.database.exists() and _legacy_holds(config.base_url):
-            return _LEGACY_PATHS
     else:
         found = sites.existing(config.sites_dir)
         if len(found) == 1:
-            return found[0].database, found[0].output
-        if not found:
-            if sites.LEGACY_DATABASE.is_file() or config.database_path is not None:
-                return _LEGACY_PATHS
+            chosen = found[0]
+        elif not found:
             raise SiteError(
                 "nothing crawled yet -- run `spa-sitemap new --url https://example.com/`"
             )
-        # Guessing between them would be a coin toss with somebody's sitemap.
-        listed = "\n  ".join(found_site.slug for found_site in found)
-        raise SiteError(
-            f"{len(found)} sites in {config.sites_dir}/ -- pick one with "
-            f"--site NAME (or --url):\n  {listed}"
-        )
+        else:
+            listed = "\n  ".join(other.slug for other in found)
+            raise SiteError(
+                f"{len(found)} sites in {config.sites_dir}/ -- pick one with "
+                f"--site NAME (or --url):\n  {listed}"
+            )
 
     return chosen.database, chosen.output
-
-
-#: The layout before crawls were kept per site: one database, one sitemap in cwd.
-_LEGACY_PATHS: Final = (sites.LEGACY_DATABASE, Path(sites.OUTPUT_NAME))
-
-
-def _legacy_holds(base_url: str) -> bool:
-    """Is the old ``db/sitemap.db`` a crawl of this same site?"""
-    if not sites.LEGACY_DATABASE.is_file():
-        return False
-    with UrlStore(sites.LEGACY_DATABASE) as store:
-        stored = store.get_meta("base_url")
-    return bool(stored) and same_site(stored or "", base_url)
 
 
 # -- commands ----------------------------------------------------------------
@@ -261,7 +229,7 @@ def cmd_new(args: argparse.Namespace) -> int:
         if other is not None and not args.force:
             log.error(
                 "%s holds %s for %s, not %s -- crawling would destroy them. "
-                "Drop --database so each site gets its own file, "
+                "Drop --site and each URL gets its own directory, "
                 "or pass --force to overwrite this one.",
                 database, _urls(known), other, base_url,
             )
@@ -418,9 +386,6 @@ def cmd_sites(args: argparse.Namespace) -> int:
     """
     config = _config_from_args(args)
     found = sites.existing(config.sites_dir)
-    if sites.LEGACY_DATABASE.is_file():
-        found = [sites.Site(slug="(legacy)", directory=sites.LEGACY_DATABASE.parent), *found]
-
     if not found:
         print("no crawls yet -- run `spa-sitemap new --url https://example.com/`")
         return EXIT_OK

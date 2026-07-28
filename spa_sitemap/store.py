@@ -201,8 +201,8 @@ class UrlStore:
         if version > SCHEMA_VERSION:
             raise StoreError(
                 f"{self.path} was written by a newer spa-sitemap (schema v{version}; "
-                f"this build understands v{SCHEMA_VERSION}). Upgrade, or use a different "
-                "--database rather than risking the crawl in this one."
+                f"this build understands v{SCHEMA_VERSION}). Upgrade rather than "
+                "risking the crawl in this one."
             )
         if version == SCHEMA_VERSION:
             return
